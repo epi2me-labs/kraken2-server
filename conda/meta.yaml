@@ -1,0 +1,35 @@
+package:
+  name: {{ environ.get('CONDA_PKG') }}
+  version: {{ environ.get('CONDA_PKG_VERSION') }}
+
+source:
+    path: ../..
+
+build:
+    number: 0
+
+requirements:
+    build:
+        - {{ compiler('cxx') }}
+        - git
+        - make
+        - cmake
+
+test:
+    commands:
+        kraken2_server --help
+        kraken2_client --help
+
+about:
+    home: "https://github.com/epi2me-labs/fastcat"
+    license: MIT 
+    license_family: MIT
+    license_file: LICENSE
+    summary: "Server implementation of kraken2"
+    doc_url: https://github.com/epi2me-labs/kraken2
+    dev_url: https://github.com/epi2me-labs/kraken2 
+
+extra:
+    recipe-maintainers:
+        - cjw85
+

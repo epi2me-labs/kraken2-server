@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package kraken2proto;
+
+// Interface exported by the server.
+service Kraken2Service {
+  rpc PutSequence(stream Kraken2SequenceRequest) returns (Kraken2SequenceResults) {}
+  rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
+}
+
+message Kraken2SummaryRequest {}
+
+message Kraken2SummaryResults {
+  string summary = 1;
+}
+
+message Kraken2SequenceRequest {
+  enum SequenceFormat {
+    FORMAT_AUTO_DETECT = 0;
+    FORMAT_FASTA = 1;
+    FORMAT_FASTQ = 2;
+  }
+  SequenceFormat format = 1;
+  string header = 2;
+  string id = 3;
+  string seq = 4;
+  string quals = 5;
+  string str_representation = 6;
+}
+
+message Kraken2SequenceResults {
+  string summary = 1;
+  map<string, Kraken2SequenceResult> classifications = 2;
+}
+
+message Kraken2SequenceResult {
+  string id = 1;
+  bool classified = 2;
+  uint64 tax_id = 3;
+  string name = 4;
+  uint32 size = 5;
+  string hitlist = 6;
+}
