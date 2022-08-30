@@ -21,6 +21,8 @@ conda:
         RECIPEPATH: "../conda"
     before_script:
         - export CONDA_PKG=${CI_PROJECT_NAME}
-        - export CONDA_PKG_VERSION=${CI_COMMIT_TAG/v/}
+        #- export CONDA_PKG_VERSION=${CI_COMMIT_TAG/v/}
+        - export CONDA_PKG_VERSION=v0.0.1
         - mkdir conda-build
         - cd conda-build
+    rules:
