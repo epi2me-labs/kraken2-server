@@ -3,7 +3,7 @@ package:
   version: {{ environ.get('CONDA_PKG_VERSION') }}
 
 source:
-    path: ../..
+    path: ..
 
 build:
     number: 0

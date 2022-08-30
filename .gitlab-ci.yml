@@ -20,9 +20,11 @@ conda:
         - large_ram
     extends: .deploy-conda
     variables:
-        RECIPEPATH: "conda"
+        RECIPEPATH: "../conda"
     before_script:
         - export CONDA_PKG=${CI_PROJECT_NAME}
         #- export CONDA_PKG_VERSION=${CI_COMMIT_TAG/v/}
         - export CONDA_PKG_VERSION=v1.0.0
+        - mkdir conda-build
+        - cd conda-build
     rules:
