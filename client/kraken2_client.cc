@@ -201,7 +201,7 @@ private:
             rec.set_str_representation(str_rep);
             seqs.push_back(std::move(rec));
         }
-        kseq_destory(seq);
+        kseq_destroy(seq);
         gzclose(fp);
         return true;
     }

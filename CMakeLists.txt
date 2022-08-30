@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
-find_package(protobuf CONFIG REQUIRED)
+find_package(Protobuf CONFIG REQUIRED)
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 
 ## Set a variable which points to a library installed on machine - Protobuf
