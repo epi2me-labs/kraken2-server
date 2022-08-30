@@ -1,16 +1,5 @@
-#include <iostream>
-#include <sstream>
-#include <memory>
-#include <string>
-#include <map>
-#include <cstdint>
-#include <stdexcept>
-#include <getopt.h>
-#include <csignal>
-#include <thread>
-#include <vector>
 #include <iomanip>
-#include <mutex>
+#include <future>
 
 #include "kraken2_data.h"
 #include "taxonomy.h"
@@ -22,13 +11,14 @@
 #include "utilities.h"
 
 #include "report_server.h"
+#include "thread_safe_queue.h"
 #include "Kraken2.grpc.pb.h"
 
 using namespace kraken2;
 
 using kraken2proto::Kraken2SequenceRequest;
-using kraken2proto::Kraken2SequenceResults;
 using kraken2proto::Kraken2SequenceResult;
+using kraken2proto::Kraken2SequenceResults;
 using kraken2proto::Kraken2Service;
 
 static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
@@ -66,13 +56,50 @@ class Kraken2ServerClassifier
 {
 
 public:
+    /**
+     * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is reused for all requests.
+     *
+     * @param argc
+     * @param argv
+     * @param options
+     */
     Kraken2ServerClassifier(int argc, char **argv, Options &options);
     ~Kraken2ServerClassifier();
 
-    bool ProcessSequence(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications);
+    /**
+     * @brief Classifies the vector of sequences and populates the string and map with classification summary and results respectively.
+     *
+     * @param seqs
+     * @param results
+     * @param classifications
+     * @return true
+     * @return false
+     */
+    bool ProcessBatch(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications);
+
+    /**
+     * @brief While the given future remains unresolved, classify the sequences in the thread safe queue and populate the classification queue.
+     *
+     * @param seqs
+     * @param classifications
+     * @param results
+     * @param end
+     */
+    void ProcessSequenceStream(
+        ThreadSafeQueue<Sequence> *seqs,
+        ThreadSafeQueue<Kraken2SequenceResult> *classifications,
+        std::string &results,
+        std::future<void> end);
+
+    /**
+     * @brief Return a summary of historical classifications.
+     *
+     * @return const char*
+     */
     const char *GetSummary();
 
 private:
+    // Database and Historical Stats
     Options opts;
     Taxonomy taxonomy;
     CompactHashTable hash;
@@ -81,32 +108,35 @@ private:
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
     std::mutex stats_mtx;
-    
+
     int argc;
     char **argv;
 
     void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa,
                           Taxonomy &taxonomy);
 
-    taxid_t ClassifySequence(Sequence &dna,
-                             CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
-                             Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
-                             vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
-                             vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts,
-                             std::map<string, Kraken2SequenceResult> &classifications);
+    Kraken2SequenceResult ClassifySequence(Sequence &dna,
+                                           CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+                                           Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
+                                           vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
+                                           vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts);
 
     void MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
 
-    void ProcessFiles(std::vector<Sequence> &seqs,
-                      CompactHashTable &hash, Taxonomy &tax,
-                      IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-                      taxon_counters_t &total_taxon_counters,
-                      std::map<string, Kraken2SequenceResult> &classifications);
+    void ProcessFile(Sequence &seq,
+                     CompactHashTable &hash, Taxonomy &tax,
+                     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
+                     taxon_counters_t &total_taxon_counters,
+                     Kraken2SequenceResult &classification,
+                     MinimizerScanner &scanner, vector<taxid_t> &taxa,
+                     taxon_counts_t &hit_counts, vector<string> &translated_frames, SequenceFormat &format);
 
     std::string ReportStats(struct timeval time1, struct timeval time2,
                             ClassificationStats &stats);
 
     std::string ReportTotalStats(ClassificationStats &stats);
+
+    void GenerateReport(std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy, timeval &tv1, timeval &tv2, ClassificationStats &stats, ClassificationStats &total_stats, taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters, std::mutex &stats_mtx);
 
     taxid_t ResolveTree(taxon_counts_t &hit_counts,
                         Taxonomy &taxonomy, size_t total_minimizers, Options &opts);

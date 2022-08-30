@@ -21,63 +21,76 @@ Kraken2ServerClassifier::~Kraken2ServerClassifier()
     // Any decontruction
 }
 
-bool Kraken2ServerClassifier::ProcessSequence(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications)
+bool Kraken2ServerClassifier::ProcessBatch(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications)
 {
-    taxon_counters_t taxon_counters; // stats per taxon
-
+    // Stats for the batch of sequences
+    taxon_counters_t taxon_counters;
     ClassificationStats stats = {0, 0, 0};
-
     struct timeval tv1, tv2;
+
+    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+                             idx_opts.dna_db, idx_opts.toggle_mask,
+                             idx_opts.revcom_version);
+    vector<taxid_t> taxa;
+    taxon_counts_t hit_counts;
+    vector<string> translated_frames(6);
+    SequenceFormat format;
+
+    if (seqs.size() > 0)
+        format = seqs.front().format;
 
     gettimeofday(&tv1, nullptr);
 
-    ProcessFiles(seqs, hash, taxonomy, idx_opts, opts, stats, taxon_counters, classifications);
+    for (Sequence &seq : seqs)
+    {
+        Kraken2SequenceResult classification;
+        ProcessFile(seq, hash, taxonomy, idx_opts, opts, stats, taxon_counters, classification, scanner, taxa, hit_counts, translated_frames, seq.format);
+        classifications[classification.id()] = classification;
+    }
 
     gettimeofday(&tv2, nullptr);
 
-    std::ostringstream ss;
-    auto total_unclassified = stats.total_sequences - stats.total_classified;
-    ReportKrakenStyle(ss,
-                      opts.report_zero_counts,
-                      opts.report_kmer_data,
-                      taxonomy,
-                      taxon_counters,
-                      stats.total_sequences,
-                      total_unclassified);
-
-    ss << "\n"
-       << ReportStats(tv1, tv2, stats);
-    results.assign(ss.str());
-
-    if (opts.stats)
-    {
-        stats_mtx.lock();
-
-        total_stats.total_sequences += stats.total_sequences;
-        total_stats.total_classified += stats.total_classified;
-        total_stats.total_bases += stats.total_bases;
-        for (auto &kv_pair : taxon_counters)
-        {
-            total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
-        }
-        ss.clear();
-        total_unclassified = total_stats.total_sequences - total_stats.total_classified;
-        ReportKrakenStyle(ss,
-                          opts.report_zero_counts,
-                          opts.report_kmer_data,
-                          taxonomy,
-                          total_taxon_counters,
-                          total_stats.total_sequences,
-                          total_unclassified);
-
-        ss << "\n"
-           << ReportTotalStats(total_stats);
-        summary.assign(ss.str());
-
-        stats_mtx.unlock();
-    }
+    GenerateReport(results, summary, opts, taxonomy, tv1, tv2, stats, total_stats, taxon_counters, total_taxon_counters, stats_mtx);
 
     return true;
+}
+
+void Kraken2ServerClassifier::ProcessSequenceStream(
+    ThreadSafeQueue<Sequence> *seqs,
+    ThreadSafeQueue<Kraken2SequenceResult> *classifications,
+    std::string &results,
+    std::future<void> end)
+{
+    // Stats for the batch of sequences
+    taxon_counters_t taxon_counters;
+    ClassificationStats stats = {0, 0, 0};
+    struct timeval tv1, tv2;
+
+    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+                             idx_opts.dna_db, idx_opts.toggle_mask,
+                             idx_opts.revcom_version);
+    vector<taxid_t> taxa;
+    taxon_counts_t hit_counts;
+    vector<string> translated_frames(6);
+
+    gettimeofday(&tv1, nullptr);
+
+    // Classify while reads are still being received and the sequence queue is not empty
+    while (end.wait_for(std::chrono::seconds(0)) == std::future_status::timeout)
+    {
+        std::optional<Sequence> seq = seqs->pop();
+        if (seq.has_value())
+        {
+            Kraken2SequenceResult classification;
+            // Acquire standard map of results
+            ProcessFile(seq.value(), hash, taxonomy, idx_opts, opts, stats, taxon_counters, classification, scanner, taxa, hit_counts, translated_frames, seq.value().format);
+            classifications->push(std::move(classification));
+        }
+    }
+
+    gettimeofday(&tv2, nullptr);
+
+    GenerateReport(results, summary, opts, taxonomy, tv1, tv2, stats, total_stats, taxon_counters, total_taxon_counters, stats_mtx);
 }
 
 const char *Kraken2ServerClassifier::GetSummary()
@@ -85,6 +98,10 @@ const char *Kraken2ServerClassifier::GetSummary()
     return summary.c_str();
 }
 
+////////////////////////////////
+// The following methods are adapted from the Kraken2 source code.
+// Paired end and quick mode logic has been removed.
+////////////////////////////////
 void Kraken2ServerClassifier::AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
 {
     auto last_code = taxa[0];
@@ -138,11 +155,10 @@ void Kraken2ServerClassifier::AddHitlistString(ostringstream &oss, vector<taxid_
     }
 }
 
-taxid_t Kraken2ServerClassifier::ClassifySequence(Sequence &dna, CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
-                                                  Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
-                                                  vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
-                                                  vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts,
-                                                  std::map<string, Kraken2SequenceResult> &classifications)
+Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(Sequence &dna, CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+                                                                Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
+                                                                vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
+                                                                vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts)
 {
     uint64_t *minimizer_ptr;
     taxid_t call = 0;
@@ -252,9 +268,7 @@ taxid_t Kraken2ServerClassifier::ClassifySequence(Sequence &dna, CompactHashTabl
         result.set_hitlist(hitlist.str());
     }
 
-    classifications[dna.id] = result;
-
-    return call;
+    return result;
 }
 
 void Kraken2ServerClassifier::MaskLowQualityBases(Sequence &dna, int minimum_quality_score)
@@ -271,36 +285,23 @@ void Kraken2ServerClassifier::MaskLowQualityBases(Sequence &dna, int minimum_qua
     }
 }
 
-void Kraken2ServerClassifier::ProcessFiles(std::vector<Sequence> &seqs,
-                                           CompactHashTable &hash, Taxonomy &tax,
-                                           IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-                                           taxon_counters_t &total_taxon_counters,
-                                           std::map<string, Kraken2SequenceResult> &classifications)
+void Kraken2ServerClassifier::ProcessFile(Sequence &seq,
+                                          CompactHashTable &hash, Taxonomy &tax,
+                                          IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
+                                          taxon_counters_t &total_taxon_counters,
+                                          Kraken2SequenceResult &classification,
+                                          MinimizerScanner &scanner, vector<taxid_t> &taxa,
+                                          taxon_counts_t &hit_counts, vector<string> &translated_frames, SequenceFormat &format)
 {
-    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
-                             idx_opts.dna_db, idx_opts.toggle_mask,
-                             idx_opts.revcom_version);
-    vector<taxid_t> taxa;
-    taxon_counts_t hit_counts;
-    vector<string> translated_frames(6);
-    SequenceFormat format;
+    stats.total_sequences++;
 
-    if (seqs.size() > 0)
-        format = seqs.front().format;
+    if (opts.minimum_quality_score > 0)
+        MaskLowQualityBases(seq, opts.minimum_quality_score);
 
-    for (Sequence &s : seqs)
-    {
-        stats.total_sequences++;
+    classification = ClassifySequence(seq, hash, tax, idx_opts, opts, stats, scanner,
+                                      taxa, hit_counts, translated_frames, total_taxon_counters);
 
-        if (opts.minimum_quality_score > 0)
-            MaskLowQualityBases(s, opts.minimum_quality_score);
-
-        ClassifySequence(s, hash, tax, idx_opts, opts, stats, scanner,
-                         taxa, hit_counts, translated_frames, total_taxon_counters,
-                         classifications);
-
-        stats.total_bases += s.seq.size();
-    }
+    stats.total_bases += seq.seq.size();
 }
 
 taxid_t Kraken2ServerClassifier::ResolveTree(taxon_counts_t &hit_counts,
@@ -393,6 +394,51 @@ std::string Kraken2ServerClassifier::ReportTotalStats(ClassificationStats &stats
     return std::to_string(stats.total_sequences) + " sequences (" + DoubleStatToString(stats.total_bases / 1.0e6, 2) + " Mbp) processed.\n" +
            std::to_string(stats.total_classified) + " sequences classified (" + DoubleStatToString(stats.total_classified * 100.0 / stats.total_sequences, 2) + "%).\n" +
            std::to_string(total_unclassified) + " sequences unclassified (" + DoubleStatToString(total_unclassified * 100.0 / stats.total_sequences, 2) + "%).\n";
+}
+
+void Kraken2ServerClassifier::GenerateReport(std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy, timeval &tv1, timeval &tv2, ClassificationStats &stats, ClassificationStats &total_stats, taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters, std::mutex &stats_mtx)
+{
+    std::ostringstream ss;
+    auto total_unclassified = stats.total_sequences - stats.total_classified;
+    ReportKrakenStyle(ss,
+                      opts.report_zero_counts,
+                      opts.report_kmer_data,
+                      taxonomy,
+                      taxon_counters,
+                      stats.total_sequences,
+                      total_unclassified);
+
+    ss << "\n"
+       << ReportStats(tv1, tv2, stats);
+    results.assign(ss.str());
+
+    if (opts.stats)
+    {
+        stats_mtx.lock();
+
+        total_stats.total_sequences += stats.total_sequences;
+        total_stats.total_classified += stats.total_classified;
+        total_stats.total_bases += stats.total_bases;
+        for (auto &kv_pair : taxon_counters)
+        {
+            total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
+        }
+        ss.str(std::string());
+        total_unclassified = total_stats.total_sequences - total_stats.total_classified;
+        ReportKrakenStyle(ss,
+                          opts.report_zero_counts,
+                          opts.report_kmer_data,
+                          taxonomy,
+                          total_taxon_counters,
+                          total_stats.total_sequences,
+                          total_unclassified);
+
+        ss << "\n"
+           << ReportTotalStats(total_stats);
+        summary.assign(ss.str());
+
+        stats_mtx.unlock();
+    }
 }
 
 std::string Kraken2ServerClassifier::TrimPairInfo(std::string &id)

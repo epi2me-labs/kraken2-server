@@ -1,7 +1,5 @@
 # Sources for file reading and messaging
 add_library(server_client_utils
-    src/sequential_file_writer.cc
-    src/sequential_file_reader.cc
     src/utils.cc
     src/messages.cc)
 

@@ -1,10 +1,5 @@
 #include "report_server.h"
 
-using std::map;
-using std::ofstream;
-using std::string;
-using std::vector;
-
 namespace kraken2
 {
 
@@ -55,15 +50,15 @@ namespace kraken2
     sprintf(pct_buffer, "%6.2f", 100.0 * clade_counter.readCount() / total_seqs);
 
     ss << pct_buffer << "\t"
-        << clade_counter.readCount() << "\t"
-        << taxon_counter.readCount() << "\t";
+       << clade_counter.readCount() << "\t"
+       << taxon_counter.readCount() << "\t";
     if (report_kmer_data)
     {
       ss << clade_counter.kmerCount() << "\t"
-          << clade_counter.distinctKmerCount() << "\t";
+         << clade_counter.distinctKmerCount() << "\t";
     }
     ss << rank_str << "\t"
-        << taxid << "\t";
+       << taxid << "\t";
     for (auto i = 0; i < depth; i++)
       ss << "  ";
     ss << sci_name << std::endl;
@@ -167,18 +162,25 @@ namespace kraken2
   {
     taxon_counters_t clade_counters = GetCladeCounters(taxonomy, call_counters);
 
-
-    ss << "\% of Seqs" << "\t"
-        << "Clades" << "\t"
-        << "Taxonomies" << "\t";
+    ss << "\% of Seqs"
+       << "\t"
+       << "Clades"
+       << "\t"
+       << "Taxonomies"
+       << "\t";
     if (report_kmer_data)
     {
-      ss << "Kmers" << "\t"
-          << "Distinct Kmers" << "\t";
+      ss << "Kmers"
+         << "\t"
+         << "Distinct Kmers"
+         << "\t";
     }
-    ss << "Rank" << "\t"
-        << "Taxonomy ID" << "\t"
-        << "Scientific Name" << "\n";
+    ss << "Rank"
+       << "\t"
+       << "Taxonomy ID"
+       << "\t"
+       << "Scientific Name"
+       << "\n";
 
     // Special handling of the unclassified sequences
     if (total_unclassified != 0 || report_zeros)
@@ -191,5 +193,4 @@ namespace kraken2
     KrakenReportDFS(1, ss, report_zeros, report_kmer_data, taxonomy,
                     clade_counters, call_counters, total_seqs, 'R', -1, 0);
   }
-
-} // end namespace
+}

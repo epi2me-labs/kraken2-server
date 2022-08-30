@@ -4,7 +4,8 @@ package kraken2proto;
 
 // Interface exported by the server.
 service Kraken2Service {
-  rpc PutSequence(stream Kraken2SequenceRequest) returns (Kraken2SequenceResults) {}
+  rpc ClassifyBatch(stream Kraken2SequenceRequest) returns (Kraken2SequenceResults) {}
+  rpc ClassifyStream(stream Kraken2SequenceRequest) returns (stream Kraken2SequenceStreamResult) {}
   rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
 }
 
@@ -40,4 +41,11 @@ message Kraken2SequenceResult {
   string name = 4;
   uint32 size = 5;
   string hitlist = 6;
+}
+
+message Kraken2SequenceStreamResult {
+  oneof result {
+    string summary = 1;
+    Kraken2SequenceResult classification = 2;
+  }
 }

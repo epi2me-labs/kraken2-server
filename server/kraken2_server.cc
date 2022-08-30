@@ -1,15 +1,5 @@
-#include <iostream>
-#include <sstream>
-#include <memory>
-#include <string>
-#include <map>
-#include <cstdint>
-#include <stdexcept>
 #include <getopt.h>
 #include <csignal>
-#include <thread>
-#include <vector>
-#include <queue>
 
 #include <grpc/grpc.h>
 #include <grpc++/server.h>
@@ -17,7 +7,6 @@
 #include <grpc++/server_context.h>
 #include <grpc++/security/server_credentials.h>
 
-#include "sequential_file_writer.h"
 #include "messages.h"
 #include "classify_server.h"
 
@@ -26,11 +15,13 @@ using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::ServerReader;
+using grpc::ServerReaderWriter;
 using grpc::Status;
 using grpc::StatusCode;
 
 using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceResults;
+using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SummaryRequest;
 using kraken2proto::Kraken2SummaryResults;
@@ -41,44 +32,124 @@ class ServiceImpl final : public Kraken2Service::Service
 public:
     ServiceImpl(Options opts, Kraken2ServerClassifier *classifier) : options(opts), classifier(classifier) {}
 
-    void PrintSequenceSample(std::vector<Sequence> &seqs)
-    {
-        int i = 0;
-        std::cout << seqs.at(0).to_string() << std::endl;
-        for (auto &s : seqs)
-        {
-            if (i++ % 250 == 0)
-                std::cout << seqs.at(i).to_string() << std::endl;
-        }
-    }
-
-    Status PutSequence(
+    /**
+     * @brief Endpoint to classify a batch of sequences and return a unary response.
+     *
+     * @param context
+     * @param reader_writer
+     * @param response
+     * @return Status
+     */
+    Status ClassifyBatch(
         ServerContext *context,
         ServerReader<Kraken2SequenceRequest> *reader_writer,
         Kraken2SequenceResults *response) override
     {
-        // Buffer to hold chunk of sequence stream.
+        // Read the sequeneces from the stream into a vector to be classified.
         Kraken2SequenceRequest req;
         std::vector<Sequence> seqs;
-
-        // While chunks are available from the SequenceContent stream.
         while (reader_writer->Read(&req))
         {
             Sequence seq;
+            // Convert sequence messages to Kraken2 Sequence objects.
             if (SequenceRequestToSequence(req, seq))
                 seqs.push_back(std::move(seq));
         }
-        return RespondPutSequence(seqs, response);
+
+        // Classify the batch.
+        std::string summary;
+        std::map<string, Kraken2SequenceResult> classifications;
+        classifier->ProcessBatch(seqs, summary, classifications);
+
+        // Set the values of the response object which will be sent to the client.
+        response->set_summary(summary);
+        google::protobuf::Map<string, Kraken2SequenceResult> temp(classifications.begin(), classifications.end());
+        *(response->mutable_classifications()) = temp;
+
+        // End the request.
+        return Status::OK;
     }
 
+    /**
+     * @brief Endpoint to classify a stream of sequences and return a a stream of classifications as response.
+     *
+     * @param context
+     * @param reader_writer
+     * @return Status
+     */
+    Status ClassifyStream(
+        ServerContext *context,
+        ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> *reader_writer) override
+    {
+        // Prepare the thread safe sequence and classification queues and promises to manage stream operation.
+        Kraken2SequenceRequest req;
+        ThreadSafeQueue<Sequence> *seqs = new ThreadSafeQueue<Sequence>();
+        ThreadSafeQueue<Kraken2SequenceResult> *classifications = new ThreadSafeQueue<Kraken2SequenceResult>();
+        // Promise and future objects to indicate:
+        // • Reading thread has completed reading to this request handler thread
+        // • Ending operation to the sequencing thread
+        // • Ending operation to the writing thread
+        std::promise<void> reads_complete, seq_end, write_end;
+        std::future<void> seq_end_future = seq_end.get_future();
+        std::future<void> write_end_future = write_end.get_future();
+        std::future<void> rc_future = reads_complete.get_future();
+        // Summary of classified sequences
+        std::string results;
+
+        // Create threads to read sequence stream from client, classify, and write classifications back to the client.
+        std::thread read_thread(&ServiceImpl::ReadSequenceStream, this, seqs, reader_writer, std::move(reads_complete));
+        std::thread sequencer_thread(&Kraken2ServerClassifier::ProcessSequenceStream, classifier, seqs, classifications, std::ref(results), std::move(seq_end_future));
+        std::thread write_thread(&ServiceImpl::WriteSequenceStream, this, classifications, reader_writer, std::move(write_end_future));
+
+        // Hold the stream open for as long as the client keeps their write stream open.
+        rc_future.wait();
+        read_thread.join();
+        // Await the sequencing thread operating completely on the sequence queue while the connection remains open.
+        while (seqs->size() > 0 && !context->IsCancelled())
+        {
+        }
+        // Signal sequencing thread to end once queue is empty and await completing final duties
+        seq_end.set_value();
+        sequencer_thread.join();
+        // Await the writing thread operating completely on the classification queue while the connection remains open.
+        while (classifications->size() > 0 && !context->IsCancelled())
+        {
+        }
+        // Signal writing thread to end once queue is empty and await completing final duties
+        write_end.set_value();
+        write_thread.join();
+
+        delete seqs, classifications;
+
+        // If connection is open, send a final message containing the summary.
+        if (!context->IsCancelled())
+        {
+            Kraken2SequenceStreamResult summary;
+            summary.set_summary(results.c_str());
+            reader_writer->Write(summary);
+        }
+
+        return Status::OK;
+    }
+
+    /**
+     * @brief Endpoint to request a summary of the classification history on the server.
+     *
+     * @param context
+     * @param req
+     * @param results
+     * @return Status
+     */
     Status GetSummary(ServerContext *context,
                       const Kraken2SummaryRequest *req,
                       Kraken2SummaryResults *results) override
     {
+        // Only return summary if the server is recording history.
         if (options.stats)
         {
             results->set_summary(classifier->GetSummary());
         }
+        // Else indicate to the user it is not available.
         else
         {
             results->set_summary("Summary not available on this server.");
@@ -90,53 +161,80 @@ private:
     Options options;
     Kraken2ServerClassifier *classifier;
 
-    Status RespondPutSequence(std::vector<Sequence> &seqs, Kraken2SequenceResults *response)
+    /**
+     * @brief Member function to be executed as its own thread. Reads from the given connection until client indicates it is done. Indicates via the given promise when it is complete.
+     *
+     * @param seqs
+     * @param reader_writer
+     * @param context
+     * @param reads_complete
+     */
+    void ReadSequenceStream(
+        ThreadSafeQueue<Sequence> *seqs,
+        ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> *reader_writer,
+        std::promise<void> reads_complete)
     {
-        std::string summary;
-        std::map<string, Kraken2SequenceResult> classifications;
-        // Acquire standard map of results
-        classifier->ProcessSequence(seqs, summary, classifications);
-        response->set_summary(summary);
-        // Convert to protobuf map
-        google::protobuf::Map<string, Kraken2SequenceResult> temp(classifications.begin(), classifications.end());
-        *(response->mutable_classifications()) = temp;
+        Kraken2SequenceRequest req;
+        // While the connection remains open and the client has not indicated it is done, read sequences
+        while (reader_writer->Read(&req))
+        {
+            Sequence seq;
+            if (SequenceRequestToSequence(req, seq))
+                seqs->push(std::move(seq));
+        }
+        reads_complete.set_value();
+    }
 
-        return Status::OK;
+    /**
+     * @brief Member function to be executed as its own thread. Writes classifications to the client with the given connection until the future resolves or connection closes.
+     *
+     * @param classifications
+     * @param reader_writer
+     * @param context
+     * @param end
+     */
+    void WriteSequenceStream(
+        ThreadSafeQueue<Kraken2SequenceResult> *classifications,
+        ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> *reader_writer,
+        std::future<void> end)
+    {
+        // While the future is unresolved and connection is open, if the queue contains anything, write to the client.
+        while (end.wait_for(std::chrono::seconds(0)) == std::future_status::timeout)
+        {
+            std::optional<Kraken2SequenceResult> c = classifications->pop();
+            if (c.has_value())
+            {
+                Kraken2SequenceStreamResult result;
+                *(result.mutable_classification()) = c.value();
+                reader_writer->Write(result);
+            }
+        }
     }
 };
 
-bool shutdown_required = false;
-std::vector<std::thread> threads;
 Kraken2ServerClassifier *classifier;
-
-void CheckShutdown(std::shared_ptr<Server> server)
-{
-    while (!shutdown_required)
-        sleep(1);
-    // Does not complete inflight requests while acting as a sync server, possibly requires async
-    const std::chrono::time_point<std::chrono::system_clock> deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(10000);
-    server->Shutdown(deadline);
-}
+std::shared_ptr<Server> server;
 
 void RunServer(Options opts)
 {
     std::string server_address = "localhost:" + std::to_string(opts.port);
     ServiceImpl service(opts, classifier);
+    // Sets the max number of concurrent requests
     ResourceQuota rq;
     if (opts.max_queue > 0)
     {
-        // +1 to account for the server thread itself. If one thread were to be specified, all requests would be rejected.
+        // +1 to account for the server thread itself. If one thread were to be specified, all requests are rejected.
         rq.SetMaxThreads(opts.max_queue + 1);
     }
-    // According to gRPC devs, does not fully track gRPC memory usage and no docs on unit of memory allocation
+    // According to gRPC devs, does not fully track gRPC memory usage and no docs on unit of memory allocation - not recommended
     // rq.Resize(new_memory_allocation);
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.SetResourceQuota(rq);
     builder.RegisterService(&service);
-    std::shared_ptr<Server> server(builder.BuildAndStart());
-    std::thread shutdown_thread(CheckShutdown, server);
-    threads.push_back(std::move(shutdown_thread));
+    // Shared pointer so graceful shutdown can be invoked.
+    std::shared_ptr<Server> s(builder.BuildAndStart());
+    server = std::move(s);
     std::cout << "Server listening on " << server_address << ". Press Ctrl-C to end." << std::endl;
     server->Wait();
 }
@@ -283,30 +381,37 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
     }
 }
 
-void InitKraken(int argc, char **argv, Options &opts)
+void Shutdown()
 {
-    classifier = new Kraken2ServerClassifier(argc, argv, opts);
-    // Any additional Kraken2 initialisation
+    if (server)
+        server->Shutdown();
 }
 
-void Shutdown(int signum)
+void ShutdownAction(int signum)
 {
-    std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
-    shutdown_required = true;
-    exit(signum);
+    // Cannot invoke server->Shutdown() from within a signal handler thread, have to spin up a seperate thread
+    // https://github.com/grpc/grpc/issues/24884
+    std::thread shutdown_thread(Shutdown);
+    shutdown_thread.join();
+}
+
+// Attach a signal action to invoke graceful shutdown of the server.
+void InitInterrupt()
+{
+    struct sigaction sigIntHandler;
+    sigIntHandler.sa_handler = ShutdownAction;
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+    sigaction(SIGINT, &sigIntHandler, NULL);
 }
 
 int main(int argc, char **argv)
 {
-    signal(SIGINT, Shutdown);
+    InitInterrupt();
     Options opts;
     ParseCommandLine(argc, argv, opts);
-    InitKraken(argc, argv, opts);
-
+    classifier = new Kraken2ServerClassifier(argc, argv, opts);
     RunServer(opts);
 
-    // Join additional threads to ensure disposal before exitting
-    for (std::thread &t : threads)
-        t.join();
     return 0;
 }
