@@ -57,6 +57,7 @@ and protobuf (see [gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp
 ```
 INSTALL_ROOT=$PWD  # or something else
 
+export LDFLAGS="-lrt"
 export PROTO_DIR=$INSTALL_ROOT/proto-build
 export PATH="$PROTO_DIR/bin:$PATH"
 

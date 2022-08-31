@@ -53,14 +53,14 @@ public:
     bool ClassifyBatch(const std::string &sequence_name)
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
-        std::cout << "Extracting sequences from file: " + sequence_name << std::endl;
+        std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
         std::vector<Kraken2SequenceRequest> seqs;
         if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
             return false;
-        std::cout << "Sequences extracted successfully." << std::endl;
+        std::cerr << "Sequences extracted successfully." << std::endl;
 
         // Call the relevant endpoint and write all sequences.
-        std::cout << "Uploading sequences..." << std::endl;
+        std::cerr << "Uploading sequences..." << std::endl;
         ClientContext context;
         Kraken2SequenceResults response;
         std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer(sequence_stub->ClassifyBatch(&context, &response));
@@ -79,7 +79,7 @@ public:
                       << ": " << ex.what() << std::endl;
             return false;
         }
-        std::cout << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
+        std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
 
         // Handle the stream response
         Status status = HandleResponse(put_sequence_writer, &response);
@@ -102,15 +102,15 @@ public:
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
         std::vector<Kraken2SequenceRequest> seqs;
-        std::cout << "Extracting sequences from file: " + sequence_name << std::endl;
+        std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
         if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
             return false;
-        std::cout << "Sequences extracted successfully." << std::endl;
+        std::cerr << "Sequences extracted successfully." << std::endl;
 
         // Call the relevant endpoint and write all sequences.
         ClientContext context;
         std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> put_sequence_writer(sequence_stub->ClassifyStream(&context));
-        std::cout << "Uploading sequences..." << std::endl;
+        std::cerr << "Uploading sequences..." << std::endl;
         try
         {
             for (Kraken2SequenceRequest &s : seqs)
@@ -125,7 +125,7 @@ public:
             std::cerr << "Failed to send sequences"
                       << ": " << ex.what() << std::endl;
         }
-        std::cout << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
+        std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
 
         // Handle the classfication responses.
         Kraken2SequenceStreamResult result;
@@ -133,12 +133,12 @@ public:
         // Read until the server signals writing has concluded.
         while (put_sequence_writer->Read(&result))
         {
-            if (i % 250 == 0 && result.has_classification())
+            if (result.has_classification())
                 PrintClassification(result.classification());
             i++;
         }
         if (result.has_summary())
-            std::cout << result.summary() << std::endl;
+            std::cerr << result.summary() << std::endl;
 
         // Handle the stream response
         Status status = put_sequence_writer->Finish();
@@ -165,10 +165,10 @@ public:
         Status status = sequence_stub->GetSummary(&context, req, &response);
         if (!status.ok())
         {
-            std::cout << "Could not retrieve Kraken2 server summary." << std::endl;
+            std::cerr << "Could not retrieve Kraken2 server summary." << std::endl;
             return false;
         }
-        std::cout << response.summary() << std::endl;
+        std::cerr << response.summary() << std::endl;
         return true;
     }
 
@@ -181,8 +181,8 @@ private:
         Status status = put_sequence_writer->Finish();
         if (status.ok())
         {
-            PrintClassifications(response->classifications(), 250);
-            std::cout << response->summary() << std::endl;
+            PrintClassifications(response->classifications());
+            std::cerr << response->summary() << std::endl;
         }
         return status;
     }
@@ -193,18 +193,14 @@ private:
      * @param classifications
      * @param modulo
      */
-    void PrintClassifications(const google::protobuf::Map<std::string, Kraken2SequenceResult> classifications, uint16_t modulo)
+    void PrintClassifications(const google::protobuf::Map<std::string, Kraken2SequenceResult> classifications)
     {
-        std::cout << "Selection of classifications:" << std::endl;
-        uint16_t i;
         for (google::protobuf::MapPair<std::string, Kraken2SequenceResult> classify : classifications)
         {
             std::string key = classify.first;
             Kraken2SequenceResult val = classify.second;
-            if (i++ % modulo == 0)
-                PrintClassification(val);
+            PrintClassification(val);
         }
-        std::cout << std::endl;
     }
 
     /**
@@ -214,17 +210,13 @@ private:
      */
     void PrintClassification(Kraken2SequenceResult classification)
     {
-        // Print only a selection
-        std::string classified = classification.classified() ? "Classified" : "Unclassified";
-        std::cout << "ID: " << classification.id() << std::endl
-                  << "Results: " << std::endl
-                  << classified << std::endl
-                  << classification.tax_id() << std::endl
-                  << classification.name() << std::endl
-                  << classification.size() << std::endl
-                  << classification.hitlist() << std::endl
-                  << std::endl
-                  << std::endl;
+        std::string classified = classification.classified() ? "C" : "U";
+        std::cout
+            << classified << '\t'
+            << classification.id() << '\t'
+            << classification.tax_id() << '\t'
+            << classification.size() << '\t'
+            << classification.hitlist() << std::endl;
     }
 
     bool ExtractSequencesFromFileKseq(std::string sequence_name, std::vector<Kraken2SequenceRequest> &seqs)
