@@ -1,5 +1,6 @@
 #include <sysexits.h>
 #include <getopt.h>
+#include <fstream>
 
 #include <grpc/grpc.h>
 #include <grpc++/channel.h>
@@ -33,6 +34,7 @@ using kraken2proto::Kraken2SummaryResults;
 struct Options
 {
     std::string sequence;
+    std::string report_file;
     std::string url = "localhost";
     int port = -1;
     bool batch = false;
@@ -50,7 +52,7 @@ public:
      * @return true if response status from the server is OK
      * @return false if response status from the server is not OK
      */
-    bool ClassifyBatch(const std::string &sequence_name)
+    bool ClassifyBatch(const std::string &sequence_name, const std::string &report_file)
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
         std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
@@ -82,7 +84,7 @@ public:
         std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
 
         // Handle the stream response
-        Status status = HandleResponse(put_sequence_writer, &response);
+        Status status = HandleResponse(put_sequence_writer, &response, report_file);
         if (!status.ok())
         {
             std::cerr << "Sequence Batch RPC failed: " << status.error_message() << std::endl;
@@ -98,7 +100,7 @@ public:
      * @return true if response status from the server is OK once streaming has concluded.
      * @return false if response status from the server is not OK.
      */
-    bool ClassifySequences(const std::string &sequence_name)
+    bool ClassifySequences(const std::string &sequence_name, const std::string &report_file)
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
         std::vector<Kraken2SequenceRequest> seqs;
@@ -129,16 +131,14 @@ public:
 
         // Handle the classfication responses.
         Kraken2SequenceStreamResult result;
-        int i;
         // Read until the server signals writing has concluded.
         while (put_sequence_writer->Read(&result))
         {
             if (result.has_classification())
                 PrintClassification(result.classification());
-            i++;
         }
         if (result.has_summary())
-            std::cerr << result.summary() << std::endl;
+            PrintSummary(result.summary(), report_file);
 
         // Handle the stream response
         Status status = put_sequence_writer->Finish();
@@ -168,7 +168,7 @@ public:
             std::cerr << "Could not retrieve Kraken2 server summary." << std::endl;
             return false;
         }
-        std::cerr << response.summary() << std::endl;
+        std::cout << response.summary() << std::endl;
         return true;
     }
 
@@ -176,15 +176,36 @@ private:
     // The gRPC service stub for the service defined in Kraken2.proto
     std::unique_ptr<kraken2proto::Kraken2Service::Stub> sequence_stub;
 
-    Status HandleResponse(std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer, Kraken2SequenceResults *response)
+    Status HandleResponse(
+        std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer,
+        Kraken2SequenceResults *response,
+        const std::string &report_file)
     {
         Status status = put_sequence_writer->Finish();
         if (status.ok())
         {
             PrintClassifications(response->classifications());
-            std::cerr << response->summary() << std::endl;
+            PrintSummary(response->summary(), report_file);
         }
         return status;
+    }
+
+    void PrintSummary(const std::string &summary, const std::string &report_file)
+    {
+        if (report_file != "")
+        {
+            try
+            {
+                std::ofstream summary_file(report_file, std::ofstream::out);
+                summary_file << summary;
+                summary_file.close();
+            }
+            catch (const std::exception &ex)
+            {
+                std::cerr << "Failed to write report file"
+                          << ": " << ex.what() << std::endl;
+            }
+        }
     }
 
     /**
@@ -271,7 +292,8 @@ void Usage(int exit_code)
     std::cerr << "Usage: kraken2-client [options]" << std::endl
               << std::endl
               << "\t-h, -H, -?, --help           Usage" << std::endl
-              << "\t-s, -S, --sequence [path]    Path to sequence file (*.fastq(.gz | .bzip2))" << std::endl
+              << "\t-s, -S, --sequence [path]    Path to sequence file (*.fast(a|q)(.gz)" << std::endl
+              << "\t-r, -R  --report   [path]    Path to output report file" << std::endl
               << "\t-u, -U, --url [url]          URL to the Kraken2 server (default: localhost)" << std::endl
               << "\t-p, -P, --port [num]         Optional port number to append to the URL" << std::endl
               << "\t-b, -B, --batch              Upload the sequences as a batch and receive one response, rather than a stream" << std::endl
@@ -288,6 +310,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         {
             {"sequence", required_argument, NULL, 's'},
             {"sequence", required_argument, NULL, 'S'},
+            {"report", required_argument, NULL, 'r'},
+            {"report", required_argument, NULL, 'R'},
             {"url", required_argument, NULL, 'u'},
             {"url", required_argument, NULL, 'U'},
             {"port", required_argument, NULL, 'p'},
@@ -299,7 +323,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {NULL, 0, NULL, 0}};
     int opt;
     // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?u:U:s:S:p:P:bB", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hH?u:U:s:S:r:R:p:P:bB", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -311,6 +335,10 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         case 's':
         case 'S':
             opts.sequence = optarg;
+            break;
+        case 'r':
+        case 'R':
+            opts.report_file = optarg;
             break;
         case 'u':
         case 'U':
@@ -354,7 +382,10 @@ int main(int argc, char **argv)
     else
     {
         const std::string filename(opts.sequence);
-        succeeded = opts.batch ? client.ClassifyBatch(filename) : client.ClassifySequences(filename);
+        const std::string report_file(opts.report_file);
+        succeeded = opts.batch
+            ? client.ClassifyBatch(filename, report_file)
+            : client.ClassifySequences(filename, report_file);
     }
 
     return succeeded ? EX_OK : EX_IOERR;
