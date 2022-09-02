@@ -40,7 +40,7 @@ echo "============================="
 mkdir -p build
 pushd build
 echo "Running cmake"
-cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} ..
+cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
  
 mkdir -p "$PREFIX/bin"

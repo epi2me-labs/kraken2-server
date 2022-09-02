@@ -57,7 +57,10 @@ and protobuf (see [gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp
 ```
 INSTALL_ROOT=$PWD  # or something else
 
+# this flag might be needed on some platforms
 export LDFLAGS="-lrt"
+
+
 export PROTO_DIR=$INSTALL_ROOT/proto-build
 export PATH="$PROTO_DIR/bin:$PATH"
 
@@ -82,7 +85,7 @@ cd kraken2-server
 mkdir build
 pushd build
 # PROTO_DIR as above
-cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} ..
+cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} --config Release ..
 make -j 8
 popd
 ```
