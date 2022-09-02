@@ -7,6 +7,11 @@ project(kraken2_server_client)
 # Set the C++ standard to be used
 set(CMAKE_CXX_STANDARD 17)
 
+add_compile_options(-Wall)
+add_definitions(-DLINEAR_PROBING)
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
 find_package(Protobuf CONFIG REQUIRED)
