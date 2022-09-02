@@ -396,7 +396,11 @@ std::string Kraken2ServerClassifier::ReportTotalStats(ClassificationStats &stats
            std::to_string(total_unclassified) + " sequences unclassified (" + DoubleStatToString(total_unclassified * 100.0 / stats.total_sequences, 2) + "%).\n";
 }
 
-void Kraken2ServerClassifier::GenerateReport(std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy, timeval &tv1, timeval &tv2, ClassificationStats &stats, ClassificationStats &total_stats, taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters, std::mutex &stats_mtx)
+void Kraken2ServerClassifier::GenerateReport(
+        std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy,
+        timeval &tv1, timeval &tv2, ClassificationStats &stats,
+        ClassificationStats &total_stats, taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters,
+        std::mutex &stats_mtx)
 {
     std::ostringstream ss;
     auto total_unclassified = stats.total_sequences - stats.total_classified;
@@ -407,10 +411,9 @@ void Kraken2ServerClassifier::GenerateReport(std::string &results, std::string &
                       taxon_counters,
                       stats.total_sequences,
                       total_unclassified);
-
-    ss << "\n"
-       << ReportStats(tv1, tv2, stats);
     results.assign(ss.str());
+
+    std::cerr << ReportStats(tv1, tv2, stats) << std::endl;
 
     if (opts.stats)
     {
