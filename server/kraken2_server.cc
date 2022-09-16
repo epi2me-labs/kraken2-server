@@ -25,12 +25,78 @@ using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SummaryRequest;
 using kraken2proto::Kraken2SummaryResults;
+using kraken2proto::Kraken2ShutdownRequest;
+using kraken2proto::Kraken2ShutdownResult;
+
+// Just some global state... :/
+Kraken2ServerClassifier *classifier;
+std::promise<void> *exit_requested;
+
 
 class ServiceImpl final : public Kraken2Service::Service
 {
 
 public:
-    ServiceImpl(Options opts, Kraken2ServerClassifier *classifier) : options(opts), classifier(classifier) {}
+    ServiceImpl(Options opts, Kraken2ServerClassifier *classifier, std::promise<void> *exit_requested)
+    : options(opts), classifier(classifier), exit_requested(exit_requested)
+    {}
+
+
+    /**
+     * @brief Endpoint to request a summary of the classification history on the server.
+     *
+     * @param context
+     * @param req
+     * @param results
+     * @return Status
+     */
+    Status GetSummary(
+        ServerContext *context,
+        const Kraken2SummaryRequest *req,
+        Kraken2SummaryResults *results) override
+    {
+        // Only return summary if the server is recording history.
+        if (options.stats)
+        {
+            results->set_summary(classifier->GetSummary());
+        }
+        // Else indicate to the user it is not available.
+        else
+        {
+            results->set_summary("Summary not available on this server.");
+        }
+        return Status::OK;
+    }
+
+    /**
+     * @brief Endpoint to initiate a remote shutdown of the server.
+     *
+     * @param context
+     * @param req
+     * @param results
+     * @return Status
+     */
+    Status RemoteShutdown(
+        ServerContext *context,
+        const Kraken2ShutdownRequest *req,
+        kraken2proto::Kraken2ShutdownResult *result
+    ) override
+    {
+        std::cerr << "Received shutdown request." << std::endl;
+        try
+        {
+            exit_requested->set_value();
+            result->set_successful(true);
+            std::cerr << "Shutdown request made." << std::endl;
+        }
+        catch (const std::exception &ex)
+        {
+            result->set_successful(false);
+            std::cerr << "Failed to request shutdown"
+                      << ": " << ex.what() << std::endl;
+        }
+        return Status::OK;
+    }
 
     /**
      * @brief Endpoint to classify a batch of sequences and return a unary response.
@@ -119,7 +185,8 @@ public:
         write_end.set_value();
         write_thread.join();
 
-        delete seqs, classifications;
+        delete seqs;
+        delete classifications;
 
         // If connection is open, send a final message containing the summary.
         if (!context->IsCancelled())
@@ -132,34 +199,11 @@ public:
         return Status::OK;
     }
 
-    /**
-     * @brief Endpoint to request a summary of the classification history on the server.
-     *
-     * @param context
-     * @param req
-     * @param results
-     * @return Status
-     */
-    Status GetSummary(ServerContext *context,
-                      const Kraken2SummaryRequest *req,
-                      Kraken2SummaryResults *results) override
-    {
-        // Only return summary if the server is recording history.
-        if (options.stats)
-        {
-            results->set_summary(classifier->GetSummary());
-        }
-        // Else indicate to the user it is not available.
-        else
-        {
-            results->set_summary("Summary not available on this server.");
-        }
-        return Status::OK;
-    }
 
 private:
     Options options;
     Kraken2ServerClassifier *classifier;
+    std::promise<void> *exit_requested;
 
     /**
      * @brief Member function to be executed as its own thread. Reads from the given connection until client indicates it is done. Indicates via the given promise when it is complete.
@@ -212,13 +256,11 @@ private:
     }
 };
 
-Kraken2ServerClassifier *classifier;
-std::shared_ptr<Server> server;
 
 void RunServer(Options opts)
 {
-    std::string server_address = "localhost:" + std::to_string(opts.port);
-    ServiceImpl service(opts, classifier);
+    std::string server_address = opts.host + ":" + std::to_string(opts.port);
+    ServiceImpl service(opts, classifier, exit_requested);
     // Sets the max number of concurrent requests
     ResourceQuota rq;
     if (opts.max_queue > 0)
@@ -233,10 +275,22 @@ void RunServer(Options opts)
     builder.SetResourceQuota(rq);
     builder.RegisterService(&service);
     // Shared pointer so graceful shutdown can be invoked.
-    std::shared_ptr<Server> s(builder.BuildAndStart());
-    server = std::move(s);
+    std::shared_ptr<Server> server(builder.BuildAndStart());
     std::cout << "Server listening on " << server_address << ". Press Ctrl-C to end." << std::endl;
-    server->Wait();
+
+    // handle interrupts
+    auto handler = [](int s) {
+      exit_requested->set_value();
+    };
+    // TODO: what's the actual behaviour here, i.e. what does Shutdown() do?
+    std::signal(SIGINT, handler);
+    std::signal(SIGTERM, handler);
+    std::signal(SIGQUIT, handler);
+
+    // block until exit request is set
+    auto f = exit_requested->get_future();
+    f.wait();
+    server->Shutdown();
 }
 
 void Usage(int exit_code)
@@ -248,7 +302,8 @@ void Usage(int exit_code)
               << "*\t-d, -D, --db [path]            Path to Kraken 2 database" << std::endl
               << "\t-r, -R, --max-requests [int]    Max number of requests from clients to process concurrently (0 for default)" << std::endl
               << "\t-s, -S, --no-stats              Do not track statistics of all processed sequences on this server. Saves memory long-term." << std::endl
-              << "\t-p, -P, --port [int]            Port number on which to listen for requests (0 - 65535)" << std::endl
+              << "\t-i, -I  --host-ip               Server IP address (default: localhost)." << std::endl
+              << "\t-p, -P, --port [int]            Port number on which to listen for requests (0 - 65535, default 8080.)" << std::endl
               << "\t-k, -K, --report-kmer           Include distinct k-mers in reports" << std::endl
               << "\t-z, -Z, --report-zero           Include zero count taxons in reports" << std::endl
               << "\t-t, -T, --translated-search     Use translated search when running classifications" << std::endl
@@ -270,6 +325,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {"max-requests", required_argument, NULL, 'R'},
             {"no-stats", required_argument, NULL, 's'},
             {"no-stats", required_argument, NULL, 'S'},
+            {"host-ip", required_argument, NULL, 'i'},
+            {"host-ip", required_argument, NULL, 'I'},
             {"port", required_argument, NULL, 'p'},
             {"port", required_argument, NULL, 'P'},
             {"report-kmer", no_argument, NULL, 'k'},
@@ -291,7 +348,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {NULL, 0, NULL, 0}};
     int opt;
     // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOp:P:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOx:X:p:P:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -319,6 +376,10 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         case 's':
         case 'S':
             opts.stats = false;
+            break;
+        case 'i':
+        case 'I':
+            opts.host = optarg;
             break;
         case 'p':
         case 'P':
@@ -381,36 +442,13 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
     }
 }
 
-void Shutdown()
-{
-    if (server)
-        server->Shutdown();
-}
-
-void ShutdownAction(int signum)
-{
-    // Cannot invoke server->Shutdown() from within a signal handler thread, have to spin up a seperate thread
-    // https://github.com/grpc/grpc/issues/24884
-    std::thread shutdown_thread(Shutdown);
-    shutdown_thread.join();
-}
-
-// Attach a signal action to invoke graceful shutdown of the server.
-void InitInterrupt()
-{
-    struct sigaction sigIntHandler;
-    sigIntHandler.sa_handler = ShutdownAction;
-    sigemptyset(&sigIntHandler.sa_mask);
-    sigIntHandler.sa_flags = 0;
-    sigaction(SIGINT, &sigIntHandler, NULL);
-}
 
 int main(int argc, char **argv)
 {
-    InitInterrupt();
     Options opts;
     ParseCommandLine(argc, argv, opts);
     classifier = new Kraken2ServerClassifier(argc, argv, opts);
+    exit_requested = new std::promise<void>;
     RunServer(opts);
 
     return 0;

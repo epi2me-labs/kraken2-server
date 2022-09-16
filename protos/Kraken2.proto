@@ -4,17 +4,27 @@ package kraken2proto;
 
 // Interface exported by the server.
 service Kraken2Service {
+  rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
+  rpc RemoteShutdown(Kraken2ShutdownRequest) returns (Kraken2ShutdownResult) {}
   rpc ClassifyBatch(stream Kraken2SequenceRequest) returns (Kraken2SequenceResults) {}
   rpc ClassifyStream(stream Kraken2SequenceRequest) returns (stream Kraken2SequenceStreamResult) {}
-  rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
 }
 
+// Request historical classification summary
 message Kraken2SummaryRequest {}
 
 message Kraken2SummaryResults {
   string summary = 1;
 }
 
+// Remote shutdown request
+message Kraken2ShutdownRequest {}
+
+message Kraken2ShutdownResult {
+  bool successful = 1;
+}
+
+// Classify sequences
 message Kraken2SequenceRequest {
   enum SequenceFormat {
     FORMAT_AUTO_DETECT = 0;
@@ -29,11 +39,7 @@ message Kraken2SequenceRequest {
   string str_representation = 6;
 }
 
-message Kraken2SequenceResults {
-  string summary = 1;
-  map<string, Kraken2SequenceResult> classifications = 2;
-}
-
+// - Classification result
 message Kraken2SequenceResult {
   string id = 1;
   bool classified = 2;
@@ -43,6 +49,13 @@ message Kraken2SequenceResult {
   string hitlist = 6;
 }
 
+// - whole batch in one
+message Kraken2SequenceResults {
+  string summary = 1;
+  map<string, Kraken2SequenceResult> classifications = 2;
+}
+
+// - a stream of results
 message Kraken2SequenceStreamResult {
   oneof result {
     string summary = 1;

@@ -29,15 +29,18 @@ using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SummaryRequest;
 using kraken2proto::Kraken2SummaryResults;
+using kraken2proto::Kraken2ShutdownRequest;
+using kraken2proto::Kraken2ShutdownResult;
 
 // Command line options
 struct Options
 {
     std::string sequence;
     std::string report_file;
-    std::string url = "localhost";
-    int port = -1;
+    std::string host = "localhost";
+    int port = 8080;
     bool batch = false;
+    bool shutdown = false;
 };
 
 class SequenceClient
@@ -172,6 +175,29 @@ public:
         return true;
     }
 
+    bool ShutdownServer()
+    {
+        ClientContext context;
+        Kraken2ShutdownRequest req;
+        Kraken2ShutdownResult response;
+        Status status = sequence_stub->RemoteShutdown(&context, req, &response);
+        if (!status.ok())
+        {
+            std::cerr << "Failed to send shutdown request." << std::endl;
+            return false;
+        }
+        if (response.successful())
+        {
+            std::cerr << "Shutdown request processed." << std::endl;
+            return true;
+        }
+        else
+        {
+            std::cerr << "Shutdown request not processed correctly." << std::endl;
+            return false;
+        }
+    }
+
 private:
     // The gRPC service stub for the service defined in Kraken2.proto
     std::unique_ptr<kraken2proto::Kraken2Service::Stub> sequence_stub;
@@ -294,9 +320,10 @@ void Usage(int exit_code)
               << "\t-h, -H, -?, --help           Usage" << std::endl
               << "\t-s, -S, --sequence [path]    Path to sequence file (*.fast(a|q)(.gz)" << std::endl
               << "\t-r, -R  --report   [path]    Path to output report file" << std::endl
-              << "\t-u, -U, --url [url]          URL to the Kraken2 server (default: localhost)" << std::endl
-              << "\t-p, -P, --port [num]         Optional port number to append to the URL" << std::endl
+              << "\t-i, -I  --host-ip            Server IP address (default: localhost)." << std::endl
+              << "\t-p, -P, --port [num]         Server port (default: 8080)." << std::endl
               << "\t-b, -B, --batch              Upload the sequences as a batch and receive one response, rather than a stream" << std::endl
+              << "\t-k, -K, --shutdown           Shutdown server" << std::endl
               << std::endl
               << "Leave sequence blank to request the total summary data from the specified endpoint." << std::endl
               << std::endl;
@@ -312,12 +339,14 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {"sequence", required_argument, NULL, 'S'},
             {"report", required_argument, NULL, 'r'},
             {"report", required_argument, NULL, 'R'},
-            {"url", required_argument, NULL, 'u'},
-            {"url", required_argument, NULL, 'U'},
+            {"host-ip", required_argument, NULL, 'i'},
+            {"host-ip", required_argument, NULL, 'I'},
             {"port", required_argument, NULL, 'p'},
             {"port", required_argument, NULL, 'P'},
             {"batch", required_argument, NULL, 'b'},
             {"batch", required_argument, NULL, 'B'},
+            {"shutdown", no_argument, NULL, 'k'},
+            {"shutdown", no_argument, NULL, 'K'},
             {"help", no_argument, NULL, 'h'},
             {"help", no_argument, NULL, 'H'},
             {NULL, 0, NULL, 0}};
@@ -340,13 +369,17 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         case 'R':
             opts.report_file = optarg;
             break;
-        case 'u':
-        case 'U':
-            opts.url = optarg;
-            break;
         case 'b':
         case 'B':
             opts.batch = true;
+            break;
+        case 'k':
+        case 'K':
+            opts.shutdown = true;
+            break;
+        case 'i':
+        case 'I':
+            opts.host = optarg;
             break;
         case 'p':
         case 'P':
@@ -367,15 +400,16 @@ int main(int argc, char **argv)
     ParseCommandLine(argc, argv, opts);
 
     bool succeeded = false;
-    std::string server_address = opts.url;
-    if (opts.port >= 0)
-    {
-        server_address += ":" + std::to_string(opts.port);
-    }
+    std::string server_address = opts.host + ":" + std::to_string(opts.port);
 
+    std::cerr << "Connecting to server: " << server_address << "." << std::endl;
     SequenceClient client(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()));
 
-    if (opts.sequence.empty())
+    if (opts.shutdown)
+    {
+        succeeded = client.ShutdownServer();
+    }
+    else if (opts.sequence.empty())
     {
         succeeded = client.GetSummary();
     }

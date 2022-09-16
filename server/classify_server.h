@@ -28,6 +28,7 @@ static const taxid_t READING_FRAME_BORDER_TAXON = TAXID_MAX - 1;
 struct Options
 {
     string db_path;
+    string host = "localhost";
     int port = 8080;
     int max_queue = 0;
 
