@@ -272,25 +272,31 @@ void RunServer(Options opts)
     // rq.Resize(new_memory_allocation);
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);  // don't use port if already in use
     builder.SetResourceQuota(rq);
     builder.RegisterService(&service);
     // Shared pointer so graceful shutdown can be invoked.
     std::shared_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "Server listening on " << server_address << ". Press Ctrl-C to end." << std::endl;
+    if (server == nullptr) {
+        std::cout << "Failed to start server on " << server_address << ". See above for more details." << std::endl;
+        
+    } else {
+        std::cout << "Server listening on " << server_address << ". Press Ctrl-C to end." << std::endl;
 
-    // handle interrupts
-    auto handler = [](int s) {
-      exit_requested->set_value();
-    };
-    // TODO: what's the actual behaviour here, i.e. what does Shutdown() do?
-    std::signal(SIGINT, handler);
-    std::signal(SIGTERM, handler);
-    std::signal(SIGQUIT, handler);
+        // handle interrupts
+        auto handler = [](int s) {
+          exit_requested->set_value();
+        };
+        // TODO: what's the actual behaviour here, i.e. what does Shutdown() do?
+        std::signal(SIGINT, handler);
+        std::signal(SIGTERM, handler);
+        std::signal(SIGQUIT, handler);
 
-    // block until exit request is set
-    auto f = exit_requested->get_future();
-    f.wait();
-    server->Shutdown();
+        // block until exit request is set
+        auto f = exit_requested->get_future();
+        f.wait();
+        server->Shutdown();
+    }
 }
 
 void Usage(int exit_code)
@@ -323,8 +329,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {"db", required_argument, NULL, 'D'},
             {"max-requests", required_argument, NULL, 'r'},
             {"max-requests", required_argument, NULL, 'R'},
-            {"no-stats", required_argument, NULL, 's'},
-            {"no-stats", required_argument, NULL, 'S'},
+            {"no-stats", no_argument, NULL, 's'},
+            {"no-stats", no_argument, NULL, 'S'},
             {"host-ip", required_argument, NULL, 'i'},
             {"host-ip", required_argument, NULL, 'I'},
             {"port", required_argument, NULL, 'p'},
