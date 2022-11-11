@@ -57,6 +57,8 @@ class Kraken2ServerClassifier
 {
 
 public:
+    bool index_loaded = false;
+
     /**
      * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is reused for all requests.
      *
@@ -66,6 +68,12 @@ public:
      */
     Kraken2ServerClassifier(int argc, char **argv, Options &options);
     ~Kraken2ServerClassifier();
+
+    /**
+     * @brief Load kraken2 index
+     * 
+     */
+    void LoadIndex(); //int argc, char **argv, Options &options);
 
     /**
      * @brief Classifies the vector of sequences and populates the string and map with classification summary and results respectively.

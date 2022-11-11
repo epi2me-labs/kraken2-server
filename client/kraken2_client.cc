@@ -52,16 +52,17 @@ public:
      * @brief Send a batch of sequences from a kseq file and receive a unary response with all classifications.
      *
      * @param sequence_name
-     * @return true if response status from the server is OK
-     * @return false if response status from the server is not OK
+     * @return EX_IOERR if sequences could not be read
+     * @return EX_UNAVAILABLE if sequences could nto be sent to server
+     * @return else gRPC status code
      */
-    bool ClassifyBatch(const std::string &sequence_name, const std::string &report_file)
+    int ClassifyBatch(const std::string &sequence_name, const std::string &report_file)
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
         std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
         std::vector<Kraken2SequenceRequest> seqs;
         if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
-            return false;
+            return EX_IOERR;
         std::cerr << "Sequences extracted successfully." << std::endl;
 
         // Call the relevant endpoint and write all sequences.
@@ -82,7 +83,7 @@ public:
         {
             std::cerr << "Failed to send sequences"
                       << ": " << ex.what() << std::endl;
-            return false;
+            return EX_UNAVAILABLE;
         }
         std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
 
@@ -91,25 +92,25 @@ public:
         if (!status.ok())
         {
             std::cerr << "Sequence Batch RPC failed: " << status.error_message() << std::endl;
-            return false;
         }
-        return true;
+        return status.error_code();
     }
 
     /**
      * @brief Send sequences from a kseq file as a stream and receive classifications individually as a stream.
      *
      * @param sequence_name
-     * @return true if response status from the server is OK once streaming has concluded.
-     * @return false if response status from the server is not OK.
+     * @return EX_IOERR if sequences could not be read
+     * @return EX_UNAVAILABLE if sequences could nto be sent to server
+     * @return else gRPC status code
      */
-    bool ClassifySequences(const std::string &sequence_name, const std::string &report_file)
+    int ClassifySequences(const std::string &sequence_name, const std::string &report_file)
     {
         // Extract (and decompress if necessary) the sequences from the kseq file.
         std::vector<Kraken2SequenceRequest> seqs;
         std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
         if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
-            return false;
+            return EX_IOERR;
         std::cerr << "Sequences extracted successfully." << std::endl;
 
         // Call the relevant endpoint and write all sequences.
@@ -129,6 +130,7 @@ public:
         {
             std::cerr << "Failed to send sequences"
                       << ": " << ex.what() << std::endl;
+            return EX_UNAVAILABLE;
         }
         std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
 
@@ -148,18 +150,16 @@ public:
         if (!status.ok())
         {
             std::cerr << "Sequence Stream RPC failed: " << status.error_message() << std::endl;
-            return false;
         }
-        return true;
+        return status.error_code();
     }
 
     /**
      * @brief Request a summary of the classification history on the server.
      *
-     * @return true if response status from the server is OK.
-     * @return false if response status from the server is not OK.
+     * @return gRPC status code of request
      */
-    bool GetSummary()
+    int GetSummary()
     {
         ClientContext context;
         Kraken2SummaryRequest req;
@@ -169,13 +169,17 @@ public:
         if (!status.ok())
         {
             std::cerr << "Could not retrieve Kraken2 server summary." << std::endl;
-            return false;
         }
         std::cout << response.summary() << std::endl;
-        return true;
+        return status.error_code();
     }
 
-    bool ShutdownServer()
+    /**
+     * @brief Shutdown the server remotely
+     *
+     * @return gRPC status code of request
+     */
+    int ShutdownServer()
     {
         ClientContext context;
         Kraken2ShutdownRequest req;
@@ -184,18 +188,16 @@ public:
         if (!status.ok())
         {
             std::cerr << "Failed to send shutdown request." << std::endl;
-            return false;
         }
         if (response.successful())
         {
             std::cerr << "Shutdown request processed." << std::endl;
-            return true;
         }
         else
         {
             std::cerr << "Shutdown request not processed correctly." << std::endl;
-            return false;
         }
+        return status.error_code();
     }
 
 private:
@@ -399,7 +401,7 @@ int main(int argc, char **argv)
     Options opts;
     ParseCommandLine(argc, argv, opts);
 
-    bool succeeded = false;
+    int rtn_code = 0;
     std::string server_address = opts.host + ":" + std::to_string(opts.port);
 
     std::cerr << "Connecting to server: " << server_address << "." << std::endl;
@@ -407,20 +409,21 @@ int main(int argc, char **argv)
 
     if (opts.shutdown)
     {
-        succeeded = client.ShutdownServer();
+        rtn_code = client.ShutdownServer();
     }
     else if (opts.sequence.empty())
     {
-        succeeded = client.GetSummary();
+        rtn_code = client.GetSummary();
     }
     else
     {
         const std::string filename(opts.sequence);
         const std::string report_file(opts.report_file);
-        succeeded = opts.batch
+        rtn_code = opts.batch
             ? client.ClassifyBatch(filename, report_file)
             : client.ClassifySequences(filename, report_file);
     }
 
-    return succeeded ? EX_OK : EX_IOERR;
+    std::cerr << "Return code: " << rtn_code << std::endl;
+    return rtn_code;
 }

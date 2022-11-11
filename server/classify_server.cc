@@ -2,23 +2,42 @@
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(int argc, char **argv, Options &options) : argc(argc), argv(argv), opts(options), taxonomy(opts.taxonomy_filename, opts.use_memory_mapping), hash(opts.index_filename, opts.use_memory_mapping)
 {
-    std::cerr << "Loading database information...";
+    std::thread loader([this]() {
+        LoadIndex();
+    });
+    loader.detach();
+    // should probably do better to handle error in LoadIndex
+}
 
-    idx_opts = {0};
-    ifstream idx_opt_fs(opts.options_filename);
-    struct stat sb;
-    if (stat(opts.options_filename.c_str(), &sb) < 0)
-        errx(EX_OSERR, "unable to get filesize of %s", opts.options_filename.c_str());
-    auto opts_filesize = sb.st_size;
-    idx_opt_fs.read((char *)&idx_opts, opts_filesize);
-    opts.use_translated_search = !idx_opts.dna_db;
+void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &options)
+{
+    index_loaded = false;
+    std::cerr << "Loading database information..." << std::endl;
 
-    std::cerr << " done." << endl;
+    try
+    {
+        idx_opts = {0};
+        ifstream idx_opt_fs(opts.options_filename);
+        struct stat sb;
+        if (stat(opts.options_filename.c_str(), &sb) < 0)
+            throw std::runtime_error("Unable to get filesize of index file.");
+        auto opts_filesize = sb.st_size;
+        idx_opt_fs.read((char *)&idx_opts, opts_filesize);
+        opts.use_translated_search = !idx_opts.dna_db;
+        index_loaded = true;
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Unable to load index"
+                  << ": " << ex.what() << std::endl;
+        return;
+    }
+    std::cerr << "Successfully loaded index." << std::endl;
 }
 
 Kraken2ServerClassifier::~Kraken2ServerClassifier()
 {
-    // Any decontruction
+    // Any deconstruction
 }
 
 bool Kraken2ServerClassifier::ProcessBatch(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications)
