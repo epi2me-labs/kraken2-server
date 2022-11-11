@@ -11,7 +11,7 @@ Kraken2ServerClassifier::Kraken2ServerClassifier(int argc, char **argv, Options 
 
 void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &options)
 {
-    index_loaded = false;
+    index_available = false;
     std::cerr << "Loading database information..." << std::endl;
 
     try
@@ -33,7 +33,7 @@ void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &opti
         return;
     }
     std::cerr << "Successfully loaded index." << std::endl;
-    index_loaded = true;
+    index_available = true;
 }
 
 Kraken2ServerClassifier::~Kraken2ServerClassifier()

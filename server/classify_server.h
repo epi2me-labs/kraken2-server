@@ -57,7 +57,7 @@ class Kraken2ServerClassifier
 {
 
 public:
-    bool index_loaded = false;
+    bool index_available = false;
     bool index_broken = false;
 
     /**

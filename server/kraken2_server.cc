@@ -55,7 +55,7 @@ public:
         const Kraken2SummaryRequest *req,
         Kraken2SummaryResults *results) override
     {
-        if (!classifier->index_loaded)
+        if (!classifier->index_available)
         {
             return IndexStatus();
         }
@@ -116,7 +116,7 @@ public:
         ServerReader<Kraken2SequenceRequest> *reader_writer,
         Kraken2SequenceResults *response) override
     {
-        if (!classifier->index_loaded)
+        if (!classifier->index_available)
         {
             return IndexStatus();
         }
@@ -157,7 +157,7 @@ public:
         ServerContext *context,
         ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> *reader_writer) override
     {
-        if (!classifier->index_loaded)
+        if (!classifier->index_available)
         {
             return IndexStatus();
         }
@@ -226,7 +226,7 @@ private:
 
     grpc::Status IndexStatus()
     {
-        if(!classifier->index_loaded)
+        if(!classifier->index_available)
         {
             return classifier->index_broken ? IndexError : IndexNotLoaded;
         }
@@ -485,5 +485,5 @@ int main(int argc, char **argv)
     exit_requested = new std::promise<void>;
     RunServer(opts);
 
-    return classifier->index_loaded ? EX_OK : EX_IOERR;
+    return classifier->index_available ? EX_OK : EX_IOERR;
 }
