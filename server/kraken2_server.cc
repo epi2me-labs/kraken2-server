@@ -57,7 +57,7 @@ public:
     {
         if (!classifier->index_loaded)
         {
-            return IndexNotLoaded;
+            return IndexStatus();
         }
 
         // Only return summary if the server is recording history.
@@ -118,7 +118,7 @@ public:
     {
         if (!classifier->index_loaded)
         {
-            return IndexNotLoaded;
+            return IndexStatus();
         }
 
         // Read the sequeneces from the stream into a vector to be classified.
@@ -159,9 +159,9 @@ public:
     {
         if (!classifier->index_loaded)
         {
-            return IndexNotLoaded;
+            return IndexStatus();
         }
-        
+
         // Prepare the thread safe sequence and classification queues and promises to manage stream operation.
         Kraken2SequenceRequest req;
         ThreadSafeQueue<Sequence> *seqs = new ThreadSafeQueue<Sequence>();
@@ -219,7 +219,19 @@ private:
     Options options;
     Kraken2ServerClassifier *classifier;
     std::promise<void> *exit_requested;
+
     grpc::Status IndexNotLoaded = grpc::Status(grpc::StatusCode::UNAVAILABLE, "Index not loaded yet, please wait.");
+    grpc::Status IndexError = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "There was an error loading the index, the server will remain unavailable without intervention.");
+    grpc::Status IndexLoaded = grpc::Status(grpc::StatusCode::OK, "Index loaded.");
+
+    grpc::Status IndexStatus()
+    {
+        if(!classifier->index_loaded)
+        {
+            return classifier->index_broken ? IndexError : IndexNotLoaded;
+        }
+        return IndexLoaded;
+    } 
 
     /**
      * @brief Member function to be executed as its own thread. Reads from the given connection until client indicates it is done. Indicates via the given promise when it is complete.
@@ -473,5 +485,5 @@ int main(int argc, char **argv)
     exit_requested = new std::promise<void>;
     RunServer(opts);
 
-    return 0;
+    return classifier->index_loaded ? EX_OK : EX_IOERR;
 }

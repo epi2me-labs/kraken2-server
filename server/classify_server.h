@@ -58,6 +58,7 @@ class Kraken2ServerClassifier
 
 public:
     bool index_loaded = false;
+    bool index_broken = false;
 
     /**
      * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is reused for all requests.

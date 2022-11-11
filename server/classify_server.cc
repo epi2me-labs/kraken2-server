@@ -24,15 +24,16 @@ void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &opti
         auto opts_filesize = sb.st_size;
         idx_opt_fs.read((char *)&idx_opts, opts_filesize);
         opts.use_translated_search = !idx_opts.dna_db;
-        index_loaded = true;
     }
     catch (const std::exception &ex)
     {
         std::cerr << "Unable to load index"
                   << ": " << ex.what() << std::endl;
+        index_broken = true;
         return;
     }
     std::cerr << "Successfully loaded index." << std::endl;
+    index_loaded = true;
 }
 
 Kraken2ServerClassifier::~Kraken2ServerClassifier()
