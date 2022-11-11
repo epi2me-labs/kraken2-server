@@ -55,6 +55,11 @@ public:
         const Kraken2SummaryRequest *req,
         Kraken2SummaryResults *results) override
     {
+        if (!classifier->index_loaded)
+        {
+            return IndexNotLoaded;
+        }
+
         // Only return summary if the server is recording history.
         if (options.stats)
         {
@@ -111,6 +116,11 @@ public:
         ServerReader<Kraken2SequenceRequest> *reader_writer,
         Kraken2SequenceResults *response) override
     {
+        if (!classifier->index_loaded)
+        {
+            return IndexNotLoaded;
+        }
+
         // Read the sequeneces from the stream into a vector to be classified.
         Kraken2SequenceRequest req;
         std::vector<Sequence> seqs;
@@ -147,6 +157,11 @@ public:
         ServerContext *context,
         ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> *reader_writer) override
     {
+        if (!classifier->index_loaded)
+        {
+            return IndexNotLoaded;
+        }
+        
         // Prepare the thread safe sequence and classification queues and promises to manage stream operation.
         Kraken2SequenceRequest req;
         ThreadSafeQueue<Sequence> *seqs = new ThreadSafeQueue<Sequence>();
@@ -204,6 +219,7 @@ private:
     Options options;
     Kraken2ServerClassifier *classifier;
     std::promise<void> *exit_requested;
+    grpc::Status IndexNotLoaded = grpc::Status(grpc::StatusCode::UNAVAILABLE, "Index not loaded yet, please wait.");
 
     /**
      * @brief Member function to be executed as its own thread. Reads from the given connection until client indicates it is done. Indicates via the given promise when it is complete.
