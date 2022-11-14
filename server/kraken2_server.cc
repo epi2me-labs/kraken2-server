@@ -19,14 +19,16 @@ using grpc::ServerReaderWriter;
 using grpc::Status;
 using grpc::StatusCode;
 
-using kraken2proto::Kraken2SequenceRequest;
-using kraken2proto::Kraken2SequenceResults;
-using kraken2proto::Kraken2SequenceStreamResult;
-using kraken2proto::Kraken2Service;
+using kraken2proto::Kraken2ReadyRequest;
+using kraken2proto::Kraken2ReadyResult;
 using kraken2proto::Kraken2SummaryRequest;
 using kraken2proto::Kraken2SummaryResults;
 using kraken2proto::Kraken2ShutdownRequest;
 using kraken2proto::Kraken2ShutdownResult;
+using kraken2proto::Kraken2SequenceRequest;
+using kraken2proto::Kraken2SequenceResults;
+using kraken2proto::Kraken2SequenceStreamResult;
+using kraken2proto::Kraken2Service;
 
 // Just some global state... :/
 Kraken2ServerClassifier *classifier;
@@ -71,6 +73,23 @@ public:
             results->set_summary("Summary not available on this server.");
         }
         return Status::OK;
+    }
+
+
+    /** @brief Endpoint to request ask server if it is ready.
+     *
+     * @param context
+     * @param req
+     * @param results
+     * @return Status
+     */
+    Status ServerReady(
+        ServerContext *context,
+        const Kraken2ReadyRequest *req,
+        Kraken2ReadyResult *results) override
+    {
+        results->set_ready(classifier->index_available && !classifier->index_broken);
+        return IndexStatus();
     }
 
     /**
@@ -377,12 +396,14 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {"hit-groups", no_argument, NULL, 'G'},
             {"memory-mapping", no_argument, NULL, 'o'},
             {"memory-mapping", no_argument, NULL, 'O'},
+            {"wait", required_argument, NULL, 'w'},
+            {"wait", required_argument, NULL, 'W'},
             {"help", no_argument, NULL, 'h'},
             {"help", no_argument, NULL, 'H'},
             {NULL, 0, NULL, 0}};
     int opt;
     // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOx:X:p:P:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOx:X:p:P:wW", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -467,6 +488,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         case 'O':
             opts.use_translated_search = true;
             break;
+        case 'w':
+        case 'W':
+            opts.wait = atoi(optarg);
         }
     }
     if (opts.db_path.empty())
@@ -481,7 +505,7 @@ int main(int argc, char **argv)
 {
     Options opts;
     ParseCommandLine(argc, argv, opts);
-    classifier = new Kraken2ServerClassifier(argc, argv, opts);
+    classifier = new Kraken2ServerClassifier(opts);
     exit_requested = new std::promise<void>;
     RunServer(opts);
 

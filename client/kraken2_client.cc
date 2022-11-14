@@ -1,6 +1,8 @@
-#include <sysexits.h>
-#include <getopt.h>
+#include <chrono>
 #include <fstream>
+#include <getopt.h>
+#include <thread>
+#include <sysexits.h>
 
 #include <grpc/grpc.h>
 #include <grpc++/channel.h>
@@ -16,12 +18,19 @@
 
 KSEQ_INIT(gzFile, gzread)
 
+//using namespace std::this_thread;     // sleep_for
+using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
+//using std::chrono::system_clock;
+
 using grpc::Channel;
 using grpc::ClientContext;
 using grpc::ClientReaderWriter;
 using grpc::ClientWriter;
 using grpc::Status;
 
+
+using kraken2proto::Kraken2ReadyRequest;
+using kraken2proto::Kraken2ReadyResult;
 using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceResult;
 using kraken2proto::Kraken2SequenceResults;
@@ -58,36 +67,19 @@ public:
      */
     int ClassifyBatch(const std::string &sequence_name, const std::string &report_file)
     {
-        // Extract (and decompress if necessary) the sequences from the kseq file.
-        std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
-        std::vector<Kraken2SequenceRequest> seqs;
-        if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
-            return EX_IOERR;
-        std::cerr << "Sequences extracted successfully." << std::endl;
+        std::cerr << "Classifying sequence batch." << std::endl;
+        int state = WaitForServer();
+        if (state != 0) {return state;}
 
-        // Call the relevant endpoint and write all sequences.
-        std::cerr << "Uploading sequences..." << std::endl;
         ClientContext context;
         Kraken2SequenceResults response;
-        std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer(sequence_stub->ClassifyBatch(&context, &response));
-        try
-        {
-            for (Kraken2SequenceRequest &s : seqs)
-            {
-                put_sequence_writer->Write(s);
-            }
-            // Signal to the server that writing is complete.
-            put_sequence_writer->WritesDone();
-        }
-        catch (const std::exception &ex)
-        {
-            std::cerr << "Failed to send sequences"
-                      << ": " << ex.what() << std::endl;
-            return EX_UNAVAILABLE;
-        }
-        std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
+        std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer(
+            sequence_stub->ClassifyBatch(&context, &response));
+        state = ClassifyCommon(put_sequence_writer, sequence_name);
+        if (state != 0) {return state;}
 
-        // Handle the stream response
+        // Handle the response
+        std::cerr << "Requesting classification results." << std::endl;
         Status status = HandleResponse(put_sequence_writer, &response, report_file);
         if (!status.ok())
         {
@@ -106,37 +98,19 @@ public:
      */
     int ClassifySequences(const std::string &sequence_name, const std::string &report_file)
     {
-        // Extract (and decompress if necessary) the sequences from the kseq file.
-        std::vector<Kraken2SequenceRequest> seqs;
-        std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
-        if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
-            return EX_IOERR;
-        std::cerr << "Sequences extracted successfully." << std::endl;
+        std::cerr << "Classifying sequence stream." << std::endl;
+        int state = WaitForServer();
+        if (state != 0) {return state;}
 
-        // Call the relevant endpoint and write all sequences.
         ClientContext context;
-        std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> put_sequence_writer(sequence_stub->ClassifyStream(&context));
-        std::cerr << "Uploading sequences..." << std::endl;
-        try
-        {
-            for (Kraken2SequenceRequest &s : seqs)
-            {
-                put_sequence_writer->Write(s);
-            }
-            // Signal to the server that writing is complete.
-            put_sequence_writer->WritesDone();
-        }
-        catch (const std::exception &ex)
-        {
-            std::cerr << "Failed to send sequences"
-                      << ": " << ex.what() << std::endl;
-            return EX_UNAVAILABLE;
-        }
-        std::cerr << "Sequences uploaded.\nAwaiting classification results..." << std::endl;
+        Kraken2SequenceResults response;
+        std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>>
+            put_sequence_writer(sequence_stub->ClassifyStream(&context));
+        state = ClassifyCommon(put_sequence_writer, sequence_name);
+        if (state != 0) {return state;}
 
-        // Handle the classfication responses.
+        // Handle the classification responses.
         Kraken2SequenceStreamResult result;
-        // Read until the server signals writing has concluded.
         while (put_sequence_writer->Read(&result))
         {
             if (result.has_classification())
@@ -203,6 +177,85 @@ public:
 private:
     // The gRPC service stub for the service defined in Kraken2.proto
     std::unique_ptr<kraken2proto::Kraken2Service::Stub> sequence_stub;
+
+    int WaitForServer() {
+        // wait for server
+        while (true)
+        {
+            ClientContext context;
+            Kraken2ReadyRequest req;
+            Kraken2ReadyResult response;
+            Status status;
+            try {
+                status = sequence_stub->ServerReady(&context, req, &response);
+                if (status.ok())
+                {
+                    std::cerr << "Server responded as ready." << std::endl;
+                    break;
+                }
+            }
+            // complete failure
+            catch (const std::exception &ex)
+            {
+                std::cerr << "Server status check failed: "
+                          << ex.what() << std::endl;
+                return EX_UNAVAILABLE;
+            }
+            // not ready condition
+            if (status.error_code() == grpc::StatusCode::UNAVAILABLE)
+            {
+                // server may come back
+                std::cerr << "Server is not ready: " << status.error_message() << std::endl;
+                std::cerr << "Waiting 10s..." << std::endl;
+                std::this_thread::sleep_for(10s);
+            }
+            // unknown error
+            else
+            {
+                std::cerr << "Server is in error state: "
+                          << status.error_message() << std::endl;
+                return status.error_code();
+            }
+        }
+        return EX_OK;
+    }
+
+    /** @brief Shared code between ClassifyBatch and ClassifySequences
+     * 
+     * @tparam myWriter shared_ptr to a gRPC writer
+     * @param writer 
+     * @param sequence_name fastq/a(.gz) file
+     * @return error status
+     */
+    template <class myWriter>
+    int ClassifyCommon(myWriter &writer, const std::string &sequence_name)
+    {
+        // Extract the sequences from the kseq file.
+        std::cerr << "Extracting sequences from file: " + sequence_name << std::endl;
+        std::vector<Kraken2SequenceRequest> seqs;
+        if (!ExtractSequencesFromFileKseq(sequence_name, seqs))
+            return EX_IOERR;
+        std::cerr << "Sequences extracted successfully." << std::endl;
+
+        // send sequences to server
+        try
+        {
+            for (Kraken2SequenceRequest &s : seqs)
+            {
+                writer->Write(s);
+            }
+            writer->WritesDone();
+        }
+        catch (const std::exception &ex)
+        {
+            std::cerr << "Failed to send sequences"
+                      << ": " << ex.what() << std::endl;
+            return EX_UNAVAILABLE;
+        }
+
+        std::cerr << "Sent sequences." << std::endl;
+        return EX_OK;
+    }
 
     Status HandleResponse(
         std::shared_ptr<ClientWriter<Kraken2SequenceRequest>> put_sequence_writer,
@@ -345,8 +398,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {"host-ip", required_argument, NULL, 'I'},
             {"port", required_argument, NULL, 'p'},
             {"port", required_argument, NULL, 'P'},
-            {"batch", required_argument, NULL, 'b'},
-            {"batch", required_argument, NULL, 'B'},
+            {"batch", no_argument, NULL, 'b'},
+            {"batch", no_argument, NULL, 'B'},
             {"shutdown", no_argument, NULL, 'k'},
             {"shutdown", no_argument, NULL, 'K'},
             {"help", no_argument, NULL, 'h'},
@@ -354,7 +407,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
             {NULL, 0, NULL, 0}};
     int opt;
     // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?u:U:s:S:r:R:p:P:bB", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hH?u:U:s:S:r:R:p:P:bBkK", long_options, NULL)) != -1)
     {
         switch (opt)
         {

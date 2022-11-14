@@ -44,6 +44,7 @@ struct Options
     int minimum_quality_score = 0;
     int minimum_hit_groups = 2;
     bool use_memory_mapping = false;
+    int wait = 0;
 };
 
 struct ClassificationStats
@@ -63,18 +64,16 @@ public:
     /**
      * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is reused for all requests.
      *
-     * @param argc
-     * @param argv
      * @param options
      */
-    Kraken2ServerClassifier(int argc, char **argv, Options &options);
+    Kraken2ServerClassifier(Options &options);
     ~Kraken2ServerClassifier();
 
     /**
      * @brief Load kraken2 index
      * 
      */
-    void LoadIndex(); //int argc, char **argv, Options &options);
+    void LoadIndex();
 
     /**
      * @brief Classifies the vector of sequences and populates the string and map with classification summary and results respectively.
@@ -118,9 +117,6 @@ private:
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
     std::mutex stats_mtx;
-
-    int argc;
-    char **argv;
 
     void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa,
                           Taxonomy &taxonomy);

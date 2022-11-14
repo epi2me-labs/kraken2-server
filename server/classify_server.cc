@@ -1,6 +1,10 @@
 #include "classify_server.h"
 
-Kraken2ServerClassifier::Kraken2ServerClassifier(int argc, char **argv, Options &options) : argc(argc), argv(argv), opts(options), taxonomy(opts.taxonomy_filename, opts.use_memory_mapping), hash(opts.index_filename, opts.use_memory_mapping)
+Kraken2ServerClassifier::Kraken2ServerClassifier(
+    Options &options)
+    : opts(options),
+      taxonomy(opts.taxonomy_filename, opts.use_memory_mapping),
+      hash(opts.index_filename, opts.use_memory_mapping)
 {
     std::thread loader([this]() {
         LoadIndex();
@@ -9,10 +13,18 @@ Kraken2ServerClassifier::Kraken2ServerClassifier(int argc, char **argv, Options 
     // should probably do better to handle error in LoadIndex
 }
 
-void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &options)
+
+Kraken2ServerClassifier::~Kraken2ServerClassifier()
+{
+    // Any deconstruction
+}
+
+
+void Kraken2ServerClassifier::LoadIndex()
 {
     index_available = false;
     std::cerr << "Loading database information..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(opts.wait));
 
     try
     {
@@ -36,28 +48,23 @@ void Kraken2ServerClassifier::LoadIndex() //int argc, char **argv, Options &opti
     index_available = true;
 }
 
-Kraken2ServerClassifier::~Kraken2ServerClassifier()
-{
-    // Any deconstruction
-}
 
-bool Kraken2ServerClassifier::ProcessBatch(std::vector<Sequence> &seqs, std::string &results, std::map<string, Kraken2SequenceResult> &classifications)
+bool Kraken2ServerClassifier::ProcessBatch(
+    std::vector<Sequence> &seqs, std::string &results,
+    std::map<string, Kraken2SequenceResult> &classifications)
 {
     // Stats for the batch of sequences
     taxon_counters_t taxon_counters;
     ClassificationStats stats = {0, 0, 0};
     struct timeval tv1, tv2;
 
-    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
-                             idx_opts.dna_db, idx_opts.toggle_mask,
-                             idx_opts.revcom_version);
+    MinimizerScanner scanner(
+        idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+        idx_opts.dna_db, idx_opts.toggle_mask,
+        idx_opts.revcom_version);
     vector<taxid_t> taxa;
     taxon_counts_t hit_counts;
     vector<string> translated_frames(6);
-    SequenceFormat format;
-
-    if (seqs.size() > 0)
-        format = seqs.front().format;
 
     gettimeofday(&tv1, nullptr);
 
@@ -75,6 +82,7 @@ bool Kraken2ServerClassifier::ProcessBatch(std::vector<Sequence> &seqs, std::str
     return true;
 }
 
+
 void Kraken2ServerClassifier::ProcessSequenceStream(
     ThreadSafeQueue<Sequence> *seqs,
     ThreadSafeQueue<Kraken2SequenceResult> *classifications,
@@ -86,9 +94,10 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     ClassificationStats stats = {0, 0, 0};
     struct timeval tv1, tv2;
 
-    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
-                             idx_opts.dna_db, idx_opts.toggle_mask,
-                             idx_opts.revcom_version);
+    MinimizerScanner scanner(
+        idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+        idx_opts.dna_db, idx_opts.toggle_mask,
+        idx_opts.revcom_version);
     vector<taxid_t> taxa;
     taxon_counts_t hit_counts;
     vector<string> translated_frames(6);
@@ -113,16 +122,19 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     GenerateReport(results, summary, opts, taxonomy, tv1, tv2, stats, total_stats, taxon_counters, total_taxon_counters, stats_mtx);
 }
 
+
 const char *Kraken2ServerClassifier::GetSummary()
 {
     return summary.c_str();
 }
 
+
 ////////////////////////////////
 // The following methods are adapted from the Kraken2 source code.
 // Paired end and quick mode logic has been removed.
 ////////////////////////////////
-void Kraken2ServerClassifier::AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
+void Kraken2ServerClassifier::AddHitlistString(
+    ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
 {
     auto last_code = taxa[0];
     auto code_count = 1;
@@ -175,10 +187,11 @@ void Kraken2ServerClassifier::AddHitlistString(ostringstream &oss, vector<taxid_
     }
 }
 
-Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(Sequence &dna, CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
-                                                                Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
-                                                                vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
-                                                                vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts)
+Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
+    Sequence &dna, CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+    Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
+    vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
+    vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts)
 {
     uint64_t *minimizer_ptr;
     taxid_t call = 0;
