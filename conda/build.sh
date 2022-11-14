@@ -1,4 +1,5 @@
 #!/bin/bash
+ set -euo pipefail
 
 export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH}:${PREFIX}/include
 export LIBRARY_PATH="${PREFIX}/lib"

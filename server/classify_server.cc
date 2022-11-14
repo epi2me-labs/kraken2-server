@@ -1,3 +1,10 @@
+#include <chrono>
+#include <fstream>
+#include <getopt.h>
+#include <thread>
+#include <sysexits.h>
+
+
 #include "classify_server.h"
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(

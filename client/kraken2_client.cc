@@ -18,9 +18,7 @@
 
 KSEQ_INIT(gzFile, gzread)
 
-//using namespace std::this_thread;     // sleep_for
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
-//using std::chrono::system_clock;
 
 using grpc::Channel;
 using grpc::ClientContext;

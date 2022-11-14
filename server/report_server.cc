@@ -46,8 +46,8 @@ namespace kraken2
                                   READCOUNTER clade_counter, READCOUNTER taxon_counter,
                                   const string &rank_str, uint32_t taxid, const string &sci_name, int depth)
   {
-    char pct_buffer[10] = "";
-    sprintf(pct_buffer, "%6.2f", 100.0 * clade_counter.readCount() / total_seqs);
+    char pct_buffer[7] = "";
+    snprintf(pct_buffer, 7, "%6.2f", 100.0 * clade_counter.readCount() / total_seqs);
 
     ss << pct_buffer << "\t"
        << clade_counter.readCount() << "\t"
