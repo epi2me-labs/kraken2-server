@@ -1,16 +1,9 @@
 #!/bin/bash
- set -euo pipefail
-
-CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH:""}
-PREFIX=${PREFIX:""}
-CFLAGS=${CFLAGS:""}
-CONDA_BUILD_SYSROOT=${CONDA_BUILD_SYSROOT:""}
-MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:""}
+ set -eo pipefail
 
 export CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH}:${PREFIX}/include
 export LIBRARY_PATH="${PREFIX}/lib"
 export LD_LIBRARY_PATH="${PREFIX}/lib"
-
 
 # TODO: make macOS build work
 OS=$(uname)
