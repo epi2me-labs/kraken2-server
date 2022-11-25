@@ -330,8 +330,10 @@ private:
             std::string header;
             seq->qual.l == 0 ? header.append(">") : header.append("@");
             header.append(seq->name.s);
-            header.append(" ");
-            header.append(seq->comment.s);
+            if(seq->comment.l > 0) {
+                header.append(" ");
+                header.append(seq->comment.s);
+            }
 
             std::string str_rep;
             str_rep.append(header);
