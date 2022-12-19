@@ -415,9 +415,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts)
         case 'd':
         case 'D':
             opts.db_path = optarg;
-            opts.taxonomy_filename = optarg + std::string("taxo.k2d");
-            opts.options_filename = optarg + std::string("opts.k2d");
-            opts.index_filename = optarg + std::string("hash.k2d");
+            opts.taxonomy_filename = optarg + std::string("/taxo.k2d");
+            opts.options_filename = optarg + std::string("/opts.k2d");
+            opts.index_filename = optarg + std::string("/hash.k2d");
             break;
         case 'r':
         case 'R':
