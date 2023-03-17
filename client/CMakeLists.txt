@@ -1,6 +1,6 @@
 # Create executable for the server
 add_executable(kraken2_client
-    kraken2_client.cc)
+    kraken2_client.cc kseq.cc)
 find_package(ZLIB)
 
 target_include_directories(kraken2_server PUBLIC .)
