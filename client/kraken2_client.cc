@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -48,10 +49,6 @@ struct Options
     bool shutdown = false;
 };
 
-struct LockedCount {
-    uint64_t count = 0;
-    std::mutex lock;
-};
 
 class SequenceClient {
 public:
@@ -76,7 +73,7 @@ public:
             stream(sequence_stub->ClassifyStream(&context));
 
         // create a writer and a reader thread, track number of sequences in flight
-        LockedCount seqs_in_flight;
+        std::atomic<uint64_t> seqs_in_flight = 0;
         auto write_future = std::async(
             std::launch::async, &SequenceClient::StreamWriter, this,
             std::ref(seqs_in_flight), std::ref(sequence_name), stream);
@@ -141,16 +138,16 @@ public:
     }
 
     int StreamWriter(
-            LockedCount &seqs_in_flight, const std::string &sequence_file,
+            std::atomic<uint64_t> &seqs_in_flight, const std::string &sequence_file,
             std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> writer) {
-        int64_t BATCH_SIZE = 4000;
-        int64_t MAX_IN_FLIGHT = 40000;
+        uint64_t BATCH_SIZE = 4000;
+        uint64_t MAX_IN_FLIGHT = 40000;
         FastReader reader = FastReader(sequence_file);
         try {
             while (true) {
-                if ((seqs_in_flight.count + BATCH_SIZE >= MAX_IN_FLIGHT)) {
+                if ((seqs_in_flight + BATCH_SIZE >= MAX_IN_FLIGHT)) {
                     std::this_thread::sleep_for(10ms);
-                    std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight.count << "." << std::endl;
+                    std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
                     continue;
                 }
                 std::vector<Kraken2SequenceRequest> seqs;
@@ -159,9 +156,7 @@ public:
                     for (Kraken2SequenceRequest &s : seqs) {
                         writer->Write(s);
                     }
-                    seqs_in_flight.lock.lock();
-                    seqs_in_flight.count += n_reads;
-                    seqs_in_flight.lock.unlock();
+                    seqs_in_flight.fetch_add(n_reads);
                 }
                 else { break; }
             }
@@ -178,16 +173,14 @@ public:
     }
 
     void StreamReader(
-            LockedCount &seqs_in_flight, const std::string &report_file,
+            std::atomic<uint64_t> &seqs_in_flight, const std::string &report_file,
             std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> reader) {
         Kraken2SequenceStreamResult result;
         while (reader->Read(&result)) {
             if (result.has_classification()) {
                 PrintClassification(result.classification());
             }
-            seqs_in_flight.lock.lock();
-            seqs_in_flight.count--;
-            seqs_in_flight.lock.unlock();
+            seqs_in_flight--;
         }
         if (result.has_summary())
             PrintSummary(result.summary(), report_file);
