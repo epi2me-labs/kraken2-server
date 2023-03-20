@@ -1,6 +1,7 @@
 #include "messages.h"
 
-bool SequenceRequestToSequence(kraken2proto::Kraken2SequenceRequest &req, kraken2::Sequence &seq)
+bool SequenceRequestToSequence(
+    kraken2proto::Kraken2SequenceRequest &req, kraken2::Sequence &seq)
 {
     switch (req.format())
     {

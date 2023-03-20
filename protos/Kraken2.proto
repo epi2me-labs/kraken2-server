@@ -7,7 +7,6 @@ service Kraken2Service {
   rpc ServerReady(Kraken2ReadyRequest) returns (Kraken2ReadyResult) {}
   rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
   rpc RemoteShutdown(Kraken2ShutdownRequest) returns (Kraken2ShutdownResult) {}
-  rpc ClassifyBatch(stream Kraken2SequenceRequest) returns (Kraken2SequenceResults) {}
   rpc ClassifyStream(stream Kraken2SequenceRequest) returns (stream Kraken2SequenceStreamResult) {}
 }
 
@@ -55,12 +54,6 @@ message Kraken2SequenceResult {
   string name = 4;
   uint32 size = 5;
   string hitlist = 6;
-}
-
-// - whole batch in one
-message Kraken2SequenceResults {
-  string summary = 1;
-  map<string, Kraken2SequenceResult> classifications = 2;
 }
 
 // - a stream of results
