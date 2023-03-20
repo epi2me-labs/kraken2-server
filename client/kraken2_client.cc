@@ -31,7 +31,6 @@ using kraken2proto::Kraken2ReadyRequest;
 using kraken2proto::Kraken2ReadyResult;
 using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceResult;
-using kraken2proto::Kraken2SequenceResults;
 using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SummaryRequest;
@@ -48,6 +47,8 @@ struct Options
     int port = 8080;
     bool shutdown = false;
 };
+
+typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> ClientStream;
 
 
 class SequenceClient {
@@ -68,9 +69,8 @@ public:
         if (state != 0) {return state;}
 
         ClientContext context;
-        Kraken2SequenceResults response;
-        std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>>
-            stream(sequence_stub->ClassifyStream(&context));
+        Kraken2SequenceResult response;
+        ClientStream stream(sequence_stub->ClassifyStream(&context));
 
         // create a writer and a reader thread, track number of sequences in flight
         std::atomic<uint64_t> seqs_in_flight = 0;
@@ -139,7 +139,7 @@ public:
 
     int StreamWriter(
             std::atomic<uint64_t> &seqs_in_flight, const std::string &sequence_file,
-            std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> writer) {
+            ClientStream writer) {
         uint64_t BATCH_SIZE = 4000;
         uint64_t MAX_IN_FLIGHT = 40000;
         FastReader reader = FastReader(sequence_file);
@@ -174,7 +174,7 @@ public:
 
     void StreamReader(
             std::atomic<uint64_t> &seqs_in_flight, const std::string &report_file,
-            std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequest, Kraken2SequenceStreamResult>> reader) {
+            ClientStream reader) {
         Kraken2SequenceStreamResult result;
         while (reader->Read(&result)) {
             if (result.has_classification()) {
