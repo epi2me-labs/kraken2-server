@@ -6,12 +6,6 @@
 #include "classify_server.h"
 #include "messages.h"
 
-// number of sequences sent to a classification worker
-// this is large enough to not cause a bottleneck on my (cjw)
-// macbook, and a factor of the number of reads commonly
-// stored in a fastq file from MinKNOW
-#define BATCH_SIZE 4000
-
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
@@ -70,12 +64,10 @@ void ResultsHandler(
     while (finish.wait_for(0s) == std::future_status::timeout) {
         std::optional<BatchResults> res = results_queue->pop();
         if (res.has_value()) {
-            // inject all classifications into the output stream
-            for (Kraken2SequenceResult &kres : res->k2results) {
-                Kraken2SequenceStreamResult result;
-                *(result.mutable_classification()) = kres;
-                stream->Write(result);
-            }
+            // put the results in the stream
+            Kraken2SequenceStreamResult result;
+            *(result.mutable_classifications()) = res->k2results;
+            stream->Write(result, WriteOptions().set_buffer_hint()); 
             // update stats for the stream
             stream_stats.total_bases += res->stats.total_bases;
             stream_stats.total_classified += res->stats.total_classified;
@@ -90,7 +82,8 @@ void ResultsHandler(
 
 void Kraken2ServerClassifier::ProcessSequenceStream(
         ServerContext *context, ServerStream *stream, std::string &results) {
-
+    std::cerr << "Starting stream handler." << std::endl;
+    
     // Stats for the whole stream
     taxon_counters_t stream_taxon_counters;
     ClassificationStats stream_stats = {0, 0, 0};
@@ -107,32 +100,18 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
         stream, std::move(batches_complete),
         std::ref(stream_taxon_counters), std::ref(stream_stats), results_queue);
 
-    std::cout << "pool size: " << pool.get_thread_count() << std::endl;
-
     // Classify while reads are still being received on the input stream
-    Kraken2SequenceRequest req;
+    Kraken2SequenceRequestMulti req;
     std::vector<Kraken2SequenceRequest> seq_batch;
     std::vector<std::future<bool>> futures;
     while (!context->IsCancelled() && stream->Read(&req)) {
-        seq_batch.push_back(std::move(req));
-        if (seq_batch.size() == BATCH_SIZE) {
-            //std::cout << "jobs: " << pool.get_tasks_queued()
-            //          << " / " << pool.get_tasks_running()
-            //          << " / " << pool.get_tasks_total()
-            //          << std::endl;
-            if (opts.thread_pool > 1) {
-                futures.push_back(
-                    pool.submit(
-                        &Kraken2ServerClassifier::ProcessBatch, this,
-                        std::move(seq_batch), results_queue));
-            }
-            else {
-                ProcessBatch(std::move(seq_batch), results_queue);
-            }
-        }
+        // We could rebatch here, for now just pass the batch as is.
+        futures.push_back(
+            pool.submit(
+                &Kraken2ServerClassifier::ProcessBatch, this,
+                std::move(req), results_queue));
     }
-    // process remainder
-    if (seq_batch.size() != 0) { ProcessBatch(std::move(seq_batch), results_queue); }
+
     // wait for all futures to resolve, then wait for the queue to be empty,
     // and finally tell the results thread to finish
     for (auto &fut : futures) { fut.get(); }
@@ -147,11 +126,12 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
         stream_taxon_counters, total_taxon_counters, stats_mtx);
 
     delete results_queue;
+    std::cerr << "Finished stream handler." << std::endl;
 }
 
 
 bool Kraken2ServerClassifier::ProcessBatch(
-    std::vector<Kraken2SequenceRequest> reqs,
+    Kraken2SequenceRequestMulti reqs,
     ThreadSafeQueue<BatchResults> *result_q) {
 
     MinimizerScanner scanner(
@@ -165,7 +145,7 @@ bool Kraken2ServerClassifier::ProcessBatch(
     BatchResults results = BatchResults();
 
     kraken2::Sequence seq;
-    for (Kraken2SequenceRequest &req : reqs) {
+    for (auto &req : reqs.seqs()) {
         SequenceRequestToSequence(req, seq);
         results.stats.total_sequences++;
         results.stats.total_bases += seq.seq.size();
@@ -176,7 +156,7 @@ bool Kraken2ServerClassifier::ProcessBatch(
             seq, hash, taxonomy, idx_opts, opts, results.stats, scanner,
             taxa, hit_counts, translated_frames, results.taxon_counters);
 
-        results.k2results.push_back(std::move(classification));
+        results.k2results.mutable_classes()->Add(std::move(classification));
     }
 
     result_q->push(std::move(results));

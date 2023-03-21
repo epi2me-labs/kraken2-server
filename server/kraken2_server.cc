@@ -29,7 +29,6 @@ using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 
-typedef ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> ServerStream;
 
 
 class ServiceImpl final : public Kraken2Service::Service {
