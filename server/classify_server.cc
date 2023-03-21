@@ -4,12 +4,13 @@
 #include <sysexits.h>
 
 #include "classify_server.h"
+#include "messages.h"
 
 // number of sequences sent to a classification worker
 // this is large enough to not cause a bottleneck on my (cjw)
 // macbook, and a factor of the number of reads commonly
 // stored in a fastq file from MinKNOW
-#define BATCH_SIZE 1000
+#define BATCH_SIZE 4000
 
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
 
@@ -22,7 +23,7 @@ Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
     // handle errors in LoadIndex
     std::cout << "Creating classification thread pool with "
               << opts.thread_pool << " thread(s)." << std::endl;
-    BS::thread_pool_light pool(opts.thread_pool);
+    pool.reset(opts.thread_pool);
     std::thread loader([this]() { LoadIndex(); });
     loader.detach();
 }
@@ -62,18 +63,18 @@ void Kraken2ServerClassifier::LoadIndex() {
 }
 
 void ResultsHandler(
+        ServerStream *stream, std::future<void> finish,
         taxon_counters_t &stream_taxon_counters,
         ClassificationStats &stream_stats,
-        ThreadSafeQueue<BatchResults> *results_queue,
-        ThreadSafeQueue<Kraken2SequenceResult> *classifications,
-        std::future<void> finish) {
-
+        ThreadSafeQueue<BatchResults> *results_queue) {
     while (finish.wait_for(0s) == std::future_status::timeout) {
         std::optional<BatchResults> res = results_queue->pop();
         if (res.has_value()) {
             // inject all classifications into the output stream
             for (Kraken2SequenceResult &kres : res->k2results) {
-                classifications->push(std::move(kres));
+                Kraken2SequenceStreamResult result;
+                *(result.mutable_classification()) = kres;
+                stream->Write(result);
             }
             // update stats for the stream
             stream_stats.total_bases += res->stats.total_bases;
@@ -88,8 +89,7 @@ void ResultsHandler(
 }
 
 void Kraken2ServerClassifier::ProcessSequenceStream(
-        ThreadSafeQueue<Sequence> *seqs, ThreadSafeQueue<Kraken2SequenceResult> *classifications,
-        std::string &results, std::future<void> end) {
+        ServerContext *context, ServerStream *stream, std::string &results) {
 
     // Stats for the whole stream
     taxon_counters_t stream_taxon_counters;
@@ -98,33 +98,36 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     struct timeval tv1, tv2;
     gettimeofday(&tv1, nullptr);
 
-    // create and queue and associated thread to aggregate the results of batches
-    // and post to our output queue.
+    // create a queue and associated thread to aggregate the results of batches
+    // and post to our output stream
     ThreadSafeQueue<BatchResults> *results_queue = new ThreadSafeQueue<BatchResults>();
     std::promise<void> complete;
     std::future<void> batches_complete = complete.get_future();
     std::thread results_thread(ResultsHandler,
-        std::ref(stream_taxon_counters), std::ref(stream_stats),
-        results_queue, classifications,
-        std::move(batches_complete));
+        stream, std::move(batches_complete),
+        std::ref(stream_taxon_counters), std::ref(stream_stats), results_queue);
 
-    // Classify while reads are still being received and the sequence queue is not empty
-    std::vector<Sequence> seq_batch;
+    std::cout << "pool size: " << pool.get_thread_count() << std::endl;
+
+    // Classify while reads are still being received on the input stream
+    Kraken2SequenceRequest req;
+    std::vector<Kraken2SequenceRequest> seq_batch;
     std::vector<std::future<bool>> futures;
-    while (end.wait_for(0s) == std::future_status::timeout) {
-        std::optional<Sequence> seq = seqs->pop();
-        if (seq.has_value()) {
-            seq_batch.push_back(seq.value());
-            if (seq_batch.size() == BATCH_SIZE) {
-                if (opts.thread_pool > 1) {
-                    futures.push_back(
-                        pool.submit(
-                            &Kraken2ServerClassifier::ProcessBatch, this,
-                            std::move(seq_batch), results_queue));
-                }
-                else {
-                    ProcessBatch(std::move(seq_batch), results_queue);
-                }
+    while (!context->IsCancelled() && stream->Read(&req)) {
+        seq_batch.push_back(std::move(req));
+        if (seq_batch.size() == BATCH_SIZE) {
+            //std::cout << "jobs: " << pool.get_tasks_queued()
+            //          << " / " << pool.get_tasks_running()
+            //          << " / " << pool.get_tasks_total()
+            //          << std::endl;
+            if (opts.thread_pool > 1) {
+                futures.push_back(
+                    pool.submit(
+                        &Kraken2ServerClassifier::ProcessBatch, this,
+                        std::move(seq_batch), results_queue));
+            }
+            else {
+                ProcessBatch(std::move(seq_batch), results_queue);
             }
         }
     }
@@ -148,7 +151,7 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
 
 
 bool Kraken2ServerClassifier::ProcessBatch(
-    std::vector<Sequence> seqs,
+    std::vector<Kraken2SequenceRequest> reqs,
     ThreadSafeQueue<BatchResults> *result_q) {
 
     MinimizerScanner scanner(
@@ -161,12 +164,19 @@ bool Kraken2ServerClassifier::ProcessBatch(
 
     BatchResults results = BatchResults();
 
-    for (Sequence &seq : seqs) {
-        Kraken2SequenceResult classification;
-        ProcessFile(
-            seq, hash, taxonomy, idx_opts, opts, results.stats, results.taxon_counters,
-            classification, scanner, taxa, hit_counts, translated_frames, seq.format);
-        results.k2results.push_back(classification);
+    kraken2::Sequence seq;
+    for (Kraken2SequenceRequest &req : reqs) {
+        SequenceRequestToSequence(req, seq);
+        results.stats.total_sequences++;
+        results.stats.total_bases += seq.seq.size();
+        if (opts.minimum_quality_score > 0)
+            MaskLowQualityBases(seq, opts.minimum_quality_score);
+
+        Kraken2SequenceResult classification = ClassifySequence(
+            seq, hash, taxonomy, idx_opts, opts, results.stats, scanner,
+            taxa, hit_counts, translated_frames, results.taxon_counters);
+
+        results.k2results.push_back(std::move(classification));
     }
 
     result_q->push(std::move(results));
@@ -178,26 +188,6 @@ bool Kraken2ServerClassifier::ProcessBatch(
 // The following methods are adapted from the Kraken2 source code.
 // Paired end and quick mode logic has been removed.
 ////////////////////////////////
-void Kraken2ServerClassifier::ProcessFile(
-    Sequence &seq,
-    CompactHashTable &hash, Taxonomy &tax,
-    IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-    taxon_counters_t &total_taxon_counters,
-    Kraken2SequenceResult &classification,
-    MinimizerScanner &scanner, vector<taxid_t> &taxa,
-    taxon_counts_t &hit_counts, vector<string> &translated_frames, SequenceFormat &format) {
-    stats.total_sequences++;
-
-    if (opts.minimum_quality_score > 0)
-        MaskLowQualityBases(seq, opts.minimum_quality_score);
-
-    classification = ClassifySequence(
-        seq, hash, tax, idx_opts, opts, stats, scanner,
-        taxa, hit_counts, translated_frames, total_taxon_counters);
-
-    stats.total_bases += seq.seq.size();
-}
-
 
 void Kraken2ServerClassifier::AddHitlistString(
     ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)

@@ -12,16 +12,22 @@
 #include "utilities.h"
 
 // kraken2 server
-#include "thread_pool_light.hpp"
+#include "thread_pool.hpp"
 #include "report_server.h"
 #include "thread_safe_queue.h"
 #include "Kraken2.grpc.pb.h"
 
 using namespace kraken2;
 
+using grpc::ServerContext;
+using grpc::ServerReaderWriter;
+
+using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceResult;
-using kraken2proto::Kraken2Service;
+using kraken2proto::Kraken2SequenceStreamResult;
+
+typedef ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> ServerStream;
 
 static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
 static const taxid_t MATE_PAIR_BORDER_TAXON = TAXID_MAX;
@@ -88,17 +94,14 @@ public:
      * @brief Classify sequences in a input queue and populate the classification queue.
      */
     void ProcessSequenceStream(
-        ThreadSafeQueue<Sequence> *seqs,
-        ThreadSafeQueue<Kraken2SequenceResult> *classifications,
-        std::string &results,
-        std::future<void> end);
+        ServerContext *context, ServerStream *stream, std::string &results);
     
     /**
      * @brief Classifies the vector of sequences and populates the string and map with classification
      *        summary and results respectively.
      */
     bool ProcessBatch(
-        std::vector<Sequence> seqs,
+        std::vector<Kraken2SequenceRequest> reqs,
         ThreadSafeQueue<BatchResults> *result_q);
 
     /**
@@ -116,7 +119,7 @@ private:
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
     std::mutex stats_mtx;
-    BS::thread_pool_light pool;
+    BS::thread_pool pool;
 
     void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy);
 

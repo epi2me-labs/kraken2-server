@@ -100,48 +100,12 @@ public:
             return IndexStatus();
         }
 
-        // Prepare the thread safe sequence and classification queues and promises to manage stream operation.
-        Kraken2SequenceRequest req;
-        ThreadSafeQueue<Sequence> *seqs = new ThreadSafeQueue<Sequence>();
-        ThreadSafeQueue<Kraken2SequenceResult> *classifications = new ThreadSafeQueue<Kraken2SequenceResult>();
-        // Promise and future objects to indicate:
-        // • Reading thread has completed reading to this request handler thread
-        // • Ending operation to the sequencing thread
-        // • Ending operation to the writing thread
-        std::promise<void> reads_complete, seq_end, write_end;
-        std::future<void> seq_end_future = seq_end.get_future();
-        std::future<void> write_end_future = write_end.get_future();
-        std::future<void> rc_future = reads_complete.get_future();
-        // Summary of classified sequences
         std::string results;
 
-        // Create threads to read sequence stream from client, classify, and write classifications back to the client.
-        std::thread read_thread(
-            &ServiceImpl::ReadSequenceStream, this,
-            seqs, reader_writer, std::move(reads_complete));
-        std::thread sequencer_thread(
-            &Kraken2ServerClassifier::ProcessSequenceStream, classifier,
-            seqs, classifications, std::ref(results), std::move(seq_end_future));
-        std::thread write_thread(
-            &ServiceImpl::WriteSequenceStream, this,
-            classifications, reader_writer, std::move(write_end_future));
+        std::promise<void> complete;
+        std::future<void> reads_complete = complete.get_future();
 
-        // Hold the stream open for as long as the client keeps their write stream open.
-        rc_future.wait();
-        read_thread.join();
-        // Await the sequencing thread operating completely on the sequence queue while the connection remains open.
-        while (seqs->size() > 0 && !context->IsCancelled()) {}
-        // Signal sequencing thread to end once queue is empty and await completing final duties
-        seq_end.set_value();
-        sequencer_thread.join();
-        // Await the writing thread operating completely on the classification queue while the connection remains open.
-        while (classifications->size() > 0 && !context->IsCancelled()) {}
-        // Signal writing thread to end once queue is empty and await completing final duties
-        write_end.set_value();
-        write_thread.join();
-
-        delete seqs;
-        delete classifications;
+        classifier->ProcessSequenceStream(context, reader_writer, std::ref(results));
 
         // If connection is open, send a final message containing the summary.
         if (!context->IsCancelled()) {
@@ -169,48 +133,6 @@ private:
         return IndexLoaded;
     } 
 
-    /**
-     * @brief Read sequences until client indicates it is done. Indicates via
-     *        given promise when it is complete.
-     *
-     * @param seqs
-     * @param reader_writer
-     * @param context
-     * @param reads_complete
-     */
-    void ReadSequenceStream(
-            ThreadSafeQueue<Sequence> *seqs, ServerStream *reader_writer,
-            std::promise<void> reads_complete) {
-        Kraken2SequenceRequest req;
-        // While the connection remains open and the client has not indicated it is done, read sequences
-        while (reader_writer->Read(&req)) {
-            Sequence seq;
-            if (SequenceRequestToSequence(req, seq))
-                seqs->push(std::move(seq));
-        }
-        reads_complete.set_value();
-    }
-
-    /**
-     * @brief Write classifications to the client until future resolves or connection closes.
-     */
-    void WriteSequenceStream(
-            ThreadSafeQueue<Kraken2SequenceResult> *classifications,
-            ServerStream *reader_writer,
-            std::future<void> end) {
-        // While the future is unresolved and connection is open, if the queue
-        // contains anything, write to the client.
-        // TODO: change this, the outside word resolves the future when the queue
-        //       is empty but we are the ones consuming the queue.
-        while (end.wait_for(std::chrono::seconds(0)) == std::future_status::timeout) {
-            std::optional<Kraken2SequenceResult> c = classifications->pop();
-            if (c.has_value()) {
-                Kraken2SequenceStreamResult result;
-                *(result.mutable_classification()) = c.value();
-                reader_writer->Write(result);
-            }
-        }
-    }
 };
 
 // This is used in a lambda below and passed to std::signal, for which we
