@@ -140,8 +140,11 @@ public:
     int StreamWriter(
             std::atomic<uint64_t> &seqs_in_flight, const std::string &sequence_file,
             ClientStream writer) {
+        // TODO: it is really only MAX_IN_FLIGHT that controls the servers memory use
+        //       Note also that BATCH_SIZE from classify_server.cc will determine maximum
+        //       parallelism per client through MAX_IN_FLIGHT / BATCH_SIZE
         uint64_t BATCH_SIZE = 4000;
-        uint64_t MAX_IN_FLIGHT = 40000;
+        uint64_t MAX_IN_FLIGHT = 256000;
         FastReader reader = FastReader(sequence_file);
         try {
             while (true) {
