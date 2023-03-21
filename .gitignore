@@ -1,2 +1,12 @@
 3rdparty/
 build/
+grpc/
+proto-build/
+
+testing/virus-zymo-kraken*
+testing/*.fastq*
+
+.vscode/
+*.DS_Store
+*.swp
+*.swo
