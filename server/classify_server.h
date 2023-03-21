@@ -21,13 +21,16 @@ using namespace kraken2;
 
 using grpc::ServerContext;
 using grpc::ServerReaderWriter;
+using grpc::WriteOptions;
 
 using kraken2proto::Kraken2Service;
 using kraken2proto::Kraken2SequenceRequest;
+using kraken2proto::Kraken2SequenceRequestMulti;
 using kraken2proto::Kraken2SequenceResult;
+using kraken2proto::Kraken2SequenceResultMulti;
 using kraken2proto::Kraken2SequenceStreamResult;
 
-typedef ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequest> ServerStream;
+typedef ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequestMulti> ServerStream;
 
 static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
 static const taxid_t MATE_PAIR_BORDER_TAXON = TAXID_MAX;
@@ -65,7 +68,7 @@ struct ClassificationStats {
 
 
 struct BatchResults {
-   std::vector<Kraken2SequenceResult> k2results;
+   Kraken2SequenceResultMulti k2results;
    taxon_counters_t taxon_counters;
    ClassificationStats stats = {0, 0, 0};
 };
@@ -101,7 +104,7 @@ public:
      *        summary and results respectively.
      */
     bool ProcessBatch(
-        std::vector<Kraken2SequenceRequest> reqs,
+        Kraken2SequenceRequestMulti reqs,
         ThreadSafeQueue<BatchResults> *result_q);
 
     /**

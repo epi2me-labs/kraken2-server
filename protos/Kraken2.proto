@@ -7,7 +7,7 @@ service Kraken2Service {
   rpc ServerReady(Kraken2ReadyRequest) returns (Kraken2ReadyResult) {}
   rpc GetSummary(Kraken2SummaryRequest) returns (Kraken2SummaryResults) {}
   rpc RemoteShutdown(Kraken2ShutdownRequest) returns (Kraken2ShutdownResult) {}
-  rpc ClassifyStream(stream Kraken2SequenceRequest) returns (stream Kraken2SequenceStreamResult) {}
+  rpc ClassifyStream(stream Kraken2SequenceRequestMulti) returns (stream Kraken2SequenceStreamResult) {}
 }
 
 // Request if server is ready (index loaded)
@@ -46,6 +46,10 @@ message Kraken2SequenceRequest {
   string str_representation = 6;
 }
 
+message Kraken2SequenceRequestMulti {
+  repeated Kraken2SequenceRequest seqs = 1;
+}
+
 // - Classification result
 message Kraken2SequenceResult {
   string id = 1;
@@ -56,10 +60,14 @@ message Kraken2SequenceResult {
   string hitlist = 6;
 }
 
+message Kraken2SequenceResultMulti {
+  repeated Kraken2SequenceResult classes = 1;
+}
+
 // - a stream of results
 message Kraken2SequenceStreamResult {
   oneof result {
     string summary = 1;
-    Kraken2SequenceResult classification = 2;
+    Kraken2SequenceResultMulti classifications = 2;
   }
 }
