@@ -20,6 +20,8 @@ stages:
 .make-grpc:
     stage: build-deps
     script:
+        - ls
+        - if [ -d proto-build ]; then echo "SKIPPING gRPC build"; exit 0; fi
         - echo "SETTING UP CONDA"
         - condasetup="Mambaforge-${MINICONDAOS}-${ARCH}.sh"
         - wget https://github.com/conda-forge/miniforge/releases/latest/download/${condasetup}
@@ -46,7 +48,7 @@ stages:
             - proto-build 
 
 
-make-grpc-x64:
+make-grpc-x86:
     extends: .make-grpc
     variables:
         MINICONDAOS: Linux
@@ -82,6 +84,8 @@ conda-linux:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
+    depends:
+        - make-grpc-x86
 
 conda-linux-arm:
     extends:
@@ -92,6 +96,8 @@ conda-linux-arm:
         ARCH: aarch64
     tags:
         - arm64
+    depends:
+        - make-grpc-arm64
 
 #conda-mac:
 #    extends:
