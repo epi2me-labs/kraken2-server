@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.1]
+### Added
+- Perform classifications in shared thread pool across clients. Allows speed up of
+  processing data from a single client.
+### Removed
+- The "batch" processing mode of the server and client. This was a stream->unary gRPC,
+  that did not achieve any useful functionality beyond the stream->stream gRPC.
 
 ## [v0.1.0]
 ### Fixed
