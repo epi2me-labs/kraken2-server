@@ -23,6 +23,7 @@ stages:
         - echo "SETTING UP CONDA"
         - condasetup="Mambaforge-${MINICONDAOS}-${ARCH}.sh"
         - wget https://github.com/conda-forge/miniforge/releases/latest/download/${condasetup}
+        - ourconda=/tmp/miniconda-grpcbuild
         - bash ${condasetup} -b -p ${ourconda}
         - rm ${condasetup}
         - source ${ourconda}/bin/activate
