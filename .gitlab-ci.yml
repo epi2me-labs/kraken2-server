@@ -51,8 +51,6 @@ make-grpc-x64:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    tags:
-        - x86
 
 make-grpc-arm64:
     extends: .make-grpc
