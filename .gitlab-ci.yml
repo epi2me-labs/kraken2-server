@@ -84,7 +84,7 @@ conda-linux:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    depends:
+    needs:
         - make-grpc-x86
 
 conda-linux-arm:
@@ -96,7 +96,7 @@ conda-linux-arm:
         ARCH: aarch64
     tags:
         - arm64
-    depends:
+    needs:
         - make-grpc-arm64
 
 #conda-mac:
