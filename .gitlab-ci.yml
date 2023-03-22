@@ -13,7 +13,53 @@ variables:
 
 
 stages:
+    - build-deps
     - release
+
+
+.make-grpc:
+    stage: build-deps
+    script:
+        - echo "SETTING UP CONDA"
+        - condasetup="Mambaforge-${MINICONDAOS}-${ARCH}.sh"
+        - wget https://github.com/conda-forge/miniforge/releases/latest/download/${condasetup}
+        - bash ${condasetup} -b -p ${ourconda}
+        - rm ${condasetup}
+        - source ${ourconda}/bin/activate
+        - conda init
+        - mamba install -y git cxx-compiler make cmake
+        - echo "BUILDING gRPC UNDER CONDA for ${MINICONDAOS}-${ARCH}"
+        - export LDFLAGS="-lrt"
+        - export PROTO_DIR=$PWD/proto-build
+        - mkdir -p $PROTO_DIR
+        - git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+        - mkdir -p grpc/cmake/build
+        - pushd grpc/cmake/build
+        - cmake -DgRPC_INSTALL=ON -DgRPC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$PROTO_DIR ../..
+        - make -j 8
+        - make install
+        - popd
+    cache:
+        key: "$MINICONDAOS-$ARCH"
+        paths:
+            - proto-build 
+
+
+make-grpc-x64:
+    extends: .make-grpc
+    variables:
+        MINICONDAOS: Linux
+        ARCH: x86_64
+    tags:
+        - x86
+
+make-grpc-arm64:
+    extends: .make-grpc
+    variables:
+        MINICONDAOS: Linux
+        ARCH: aarch64
+    tags:
+        - arm64
 
 
 .conda:
@@ -21,20 +67,35 @@ stages:
         RECIPEPATH: "../conda"
     before_script:
         - export CONDA_PKG=${CI_PROJECT_NAME}
-        - export CONDA_PKG_VERSION=${CI_COMMIT_TAG/v/}
+        - VERSION=0.0.0
+        - if [[ -z "${CI_COMMIT_TAG}" ]]; then ; VERSION=${CI_COMMIT_TAG/v}; fi
+        - export CONDA_PKG_VERSION=$VERSION
         - mkdir conda-build
         - cd conda-build
+    rules:
+        - if: '$CI_COMMIT_TAG =~ /^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$/'
+        - if: '$CI_BRANCH_NAME =~ /package-build/'
 
 
 conda-linux:
     extends:
         - .deploy-conda-linux
         - .conda
+    VARIABLES:
+        MINICONDAOS: Linux
+        ARCH: x86_64
+    tags:
+        - x86
 
 conda-linux-arm:
     extends:
         - .deploy-conda-linux-arm
         - .conda
+    variables:
+        MINICONDAOS: Linux
+        ARCH: aarch64
+    tags:
+        - arm64
 
 #conda-mac:
 #    extends:

@@ -20,17 +20,22 @@ export LDFLAGS="-lrt"
 export PROTO_DIR=$PWD/proto-build
 export PATH="$PROTO_DIR/bin:$PATH"
 
-mkdir -p $PROTO_DIR
-git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
-mkdir -p grpc/cmake/build
-pushd grpc/cmake/build
-cmake -DgRPC_INSTALL=ON \
-      -DgRPC_BUILD_TESTS=OFF \
-      -DCMAKE_INSTALL_PREFIX=$PROTO_DIR \
-      ../..
-make -j 8
-make install
-popd
+if [ ! -d "${PROTO_DIR}" ]; then
+    echo "========== Build gRPC =========="
+    mkdir -p $PROTO_DIR
+    git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+    mkdir -p grpc/cmake/build
+    pushd grpc/cmake/build
+    cmake -DgRPC_INSTALL=ON \
+          -DgRPC_BUILD_TESTS=OFF \
+          -DCMAKE_INSTALL_PREFIX=$PROTO_DIR \
+          ../..
+    make -j 8
+    make install
+    popd
+else
+    echo "========== Using existing gRPC build =========="
+fi
 
 
 
