@@ -84,8 +84,6 @@ conda-linux:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    tags:
-        - x86
 
 conda-linux-arm:
     extends:
