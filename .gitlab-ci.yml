@@ -74,7 +74,7 @@ make-grpc-arm64:
     before_script:
         - export CONDA_PKG=${CI_PROJECT_NAME}
         - VERSION="0.0.0"
-        - if [[ -z "${CI_COMMIT_TAG}" ]]; then VERSION=${CI_COMMIT_TAG/v}; fi
+        - if [[ -n "${CI_COMMIT_TAG}" ]]; then VERSION=${CI_COMMIT_TAG/v}; fi
         - export CONDA_PKG_VERSION="${VERSION}"
         - mkdir conda-build
         - cd conda-build
