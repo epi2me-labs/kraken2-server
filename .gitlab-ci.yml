@@ -53,6 +53,9 @@ make-grpc-x86:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
+    tags:
+        - grid
+        - docker
 
 make-grpc-arm64:
     extends: .make-grpc
@@ -84,6 +87,9 @@ conda-linux:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
+    tags:
+        - grid
+        - docker
     needs:
         - make-grpc-x86
 
