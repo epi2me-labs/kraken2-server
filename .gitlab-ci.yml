@@ -83,7 +83,7 @@ make-grpc-arm64:
         - if: '$CI_COMMIT_BRANCH =~ /package-build/'
 
 
-conda-linux:
+conda-linux-x86:
     extends:
         - .deploy-conda-linux
         - .conda
@@ -93,7 +93,7 @@ conda-linux:
     needs:
         - make-grpc-x86
 
-conda-linux-arm:
+conda-linux-arm64:
     extends:
         - .deploy-conda-linux-arm
         - .conda
