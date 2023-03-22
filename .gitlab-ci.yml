@@ -45,6 +45,9 @@ stages:
     cache:
         key: "$MINICONDAOS-$ARCH"
         paths:
+            - proto-build
+    artifacts:
+        paths:
             - proto-build 
 
 
@@ -53,7 +56,7 @@ make-grpc-x86:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    tags:
+    tags: # just for cache
         - grid
         - docker
 
@@ -62,7 +65,7 @@ make-grpc-arm64:
     variables:
         MINICONDAOS: Linux
         ARCH: aarch64
-    tags:
+    tags: # TODO: use a single runner to hit the cache
         - arm64
 
 .conda:
@@ -87,9 +90,6 @@ conda-linux:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    tags:
-        - grid
-        - docker
     needs:
         - make-grpc-x86
 
