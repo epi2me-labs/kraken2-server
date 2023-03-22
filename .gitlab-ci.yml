@@ -81,7 +81,7 @@ conda-linux:
     extends:
         - .deploy-conda-linux
         - .conda
-    VARIABLES:
+    variables:
         MINICONDAOS: Linux
         ARCH: x86_64
     tags:
