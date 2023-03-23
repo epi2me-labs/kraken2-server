@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -113,6 +114,7 @@ public:
         int write_rtn = write_future.get();
         if (write_rtn != EX_OK) {
             read_future.wait();
+            delete batches_queue;
             return write_rtn;
         }
 
@@ -121,9 +123,10 @@ public:
         if (!status.ok()) {
             std::cerr << "Client RPC stream failed: " << status.error_message() << std::endl;
         }
-        return status.error_code();
-
+        assert(seqs_in_flight==0);
         delete batches_queue;
+    
+        return status.error_code();
     }
 
     /**
@@ -174,10 +177,11 @@ public:
             ClientStream writer) {
         try {
             while ( finish.wait_for(0s) == std::future_status::timeout || batches->size() > 0) {
-                std::optional<std::vector<Kraken2SequenceRequest>> batch = batches->pop();
-                if (batch.has_value()) {
+                std::optional<std::vector<Kraken2SequenceRequest>> item = batches->pop();
+                if (item.has_value()) {
+                    std::vector<Kraken2SequenceRequest> batch = item.value();
                     while (true) {
-                        if ((seqs_in_flight + batch->size() >= MAX_IN_FLIGHT)) {
+                        if ((seqs_in_flight + batch.size() >= MAX_IN_FLIGHT)) {
                             std::this_thread::sleep_for(10ms);
                             std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
                             continue;
@@ -186,22 +190,15 @@ public:
                     }
 
                     // rebatch to smaller batches for stream
-                    size_t size = (batch->size() - 1) / ST_BATCH_SIZE + 1;
-                    for (size_t k = 0; k < size; ++k) {
-                        std::vector<Kraken2SequenceRequest> st_batch;
-                        auto start_itr = std::next(batch->cbegin(), k*ST_BATCH_SIZE);
-                        auto end_itr = std::next(batch->cbegin(), k*ST_BATCH_SIZE + ST_BATCH_SIZE);
-                        st_batch.resize(ST_BATCH_SIZE);
-                        if (k*ST_BATCH_SIZE + ST_BATCH_SIZE > batch->size()) {
-                            end_itr = batch->cend();
-                            st_batch.resize(st_batch.size() - k*ST_BATCH_SIZE);
-                        }
-                        std::move(start_itr, end_itr, st_batch.begin());
-                        // create stream message and send
+                    size_t size = (batch.size() - 1) / ST_BATCH_SIZE + 1;
+                    std::cerr << size << " batches of " << ST_BATCH_SIZE << std::endl;
+                    for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
+                        auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
+                        size_t bsize = last - i;
                         Kraken2SequenceRequestMulti req;
-                        req.mutable_seqs()->Assign(st_batch.begin(), st_batch.end());
+                        req.mutable_seqs()->Assign(batch.begin() + i, batch.begin() + last);
                         writer->Write(req, WriteOptions().set_buffer_hint());
-                        seqs_in_flight.fetch_add(st_batch.size()); 
+                        seqs_in_flight.fetch_add(bsize); 
                     }
                 }
             }
@@ -221,41 +218,55 @@ public:
             std::atomic<uint64_t> &seqs_in_flight, const std::string &report_file,
             ClientStream reader) {
         Kraken2SequenceStreamResult result;
-        while (reader->Read(&result)) {
-            if (result.has_classifications()) {
-                for (auto &res : result.classifications().classes()){
-                    PrintClassification(res);
-                    seqs_in_flight--;
+        try {
+            while (reader->Read(&result)) {
+                if (result.has_classifications()) {
+                    for (auto &res : result.classifications().classes()){
+                        PrintClassification(res);
+                        seqs_in_flight--;
+                    }
                 }
             }
+            if (result.has_summary())
+                PrintSummary(result.summary(), report_file);
         }
-        if (result.has_summary())
-            PrintSummary(result.summary(), report_file);
+        catch (const std::exception &ex) {
+            std::cerr << "Failed to receive responses"
+                      << ": " << ex.what() << std::endl;
+            return;
+        }
     }
     
     int FastBatcher(
             const std::string &sequence_file,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches_queue) {
-        FastReader reader = FastReader(sequence_file);
-        
-        std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
         int total_reads = 0;
-        while (true) {
-            if ((batches_queue->size() >= MAX_BATCHES)) {
-                std::cerr << "Waiting before sending more. In-flight: " << batches_queue->size() << "." << std::endl;
-                std::this_thread::sleep_for(10ms);
-                continue;
-            }
+        try {
+            FastReader reader = FastReader(sequence_file);
+        
+            std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
+            while (true) {
+                if ((batches_queue->size() >= MAX_BATCHES)) {
+                    std::cerr << "Waiting before sending more. In-flight: " << batches_queue->size() << "." << std::endl;
+                    std::this_thread::sleep_for(10ms);
+                    continue;
+                }
  
-            std::vector<Kraken2SequenceRequest> seqs;
-            int n_reads;
-            if ((n_reads = reader.read(seqs, FASTQ_BATCH_SIZE)) > 0) {
-                total_reads += n_reads;
-                batches_queue->push(std::move(seqs));
+                std::vector<Kraken2SequenceRequest> seqs;
+                int n_reads;
+                if ((n_reads = reader.read(seqs, FASTQ_BATCH_SIZE)) > 0) {
+                    total_reads += n_reads;
+                    batches_queue->push(std::move(seqs));
+                }
+                else { break; }
             }
-            else { break; }
+            std::cerr << "Finished reading " << total_reads << " sequences." << std::endl;
         }
-        std::cerr << "Finished reading " << total_reads << " sequences." << std::endl;
+        catch (const std::exception &ex) {
+            std::cerr << "Failed to read sequences from file: " << sequence_file
+                      << ": " << ex.what() << std::endl;
+            return total_reads;
+        }
         return total_reads;
     }
 

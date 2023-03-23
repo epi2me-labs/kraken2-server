@@ -6,6 +6,7 @@ threads=$1
 port=$2
 nclients=$3
 input=$4
+db=$5
 echo "threads: ${threads}"
 echo "port: ${port}"
 echo "nclients: ${nclients}"
@@ -13,13 +14,18 @@ echo "nclients: ${nclients}"
 
 PATH=$PATH:../build/client:../build/server
 
-if [ ! -d virus-zymo-kraken2 ]; then
-    echo " +++ Downloading database +++"
-    wget https://ont-exd-int-s3-euwst1-epi2me-labs.s3.amazonaws.com/misc/virus-zymo-kraken.tar.gz
-    tar -xzvf virus-zymo-kraken.tar.gz
-    rm virus-zymo-kraken.tar.gz
+if [ -z $db ]; then
+    if [ ! -d virus-zymo-kraken2 ]; then
+        echo " +++ Downloading database +++"
+        wget https://ont-exd-int-s3-euwst1-epi2me-labs.s3.amazonaws.com/misc/virus-zymo-kraken.tar.gz
+        tar -xzvf virus-zymo-kraken.tar.gz
+        rm virus-zymo-kraken.tar.gz
+    else
+        echo " +++ Database downloaded previously +++"
+    fi
+    db="virus-zymo-kraken2"
 else
-    echo " +++ Database downloaded previously +++"
+    echo " +++ Using provided database +++"
 fi
 
 if [ -z "$input" ]; then
@@ -41,7 +47,7 @@ kraken2_client --port $port --host-ip 127.0.0.1
 
 echo ""
 echo " +++ Starting server +++"
-kraken2_server --db virus-zymo-kraken2 --host-ip 127.0.0.1 --port $port --wait 2 --thread-pool ${threads} &
+kraken2_server --db $db --host-ip 127.0.0.1 --port $port --wait 2 --thread-pool ${threads} &
 sleep 5  # give database time to load
 
 echo ""
@@ -51,8 +57,8 @@ function run() {
     port=$2
     client=$3
     echo "$input, $port, $client"
-    kraken2_client --report "kraken.stream.report" --sequence $input  --port $port --host-ip 127.0.0.1 \
-        | sort -k 2 > client-$client.stream.classifications.fasta.txt
+    time kraken2_client --report "kraken.stream.report" --sequence $input  --port $port --host-ip 127.0.0.1 > tmp$client
+    #cat tmp$client | sort -k 2 > client-$client.stream.classifications.fasta.txt
 }
 export -f run
 

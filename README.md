@@ -97,3 +97,30 @@ build/server/kraken2_server
 build/client/kraken2_client
 ```
 
+## Benchmarks
+
+Benchmarking script from `testing/run_server.sh`
+
+**Single client test**
+
+*MacBook Pro 14-inch 2021, M1 Max, 64Gb. macOS 13.2.1. Clang 13.1.6. 1190.33 Mbp per client*
+
+| clients | server threads | client time / s | server throughput / Mbp/m |
+|---------|----------------|-----------------|---------------------------|
+|       1 |              2 |            48.8 |                      1462 |
+|       1 |              4 |            25.1 |                      2839 |
+|       1 |              6 |            18.4 |                      3876 |
+|       1 |              8 |            16.8 |                      4237 |
+
+**Multi client test**
+
+*Intel Xeon Gold 6230, Ubuntu 16.04.7, gcc 11.3.0. 991.94 Mbp per client*
+
+| clients | server threads | client time / s | server throughput / Mbp/m |
+|---------|----------------|-----------------|---------------------------|
+|       1 |             64 |            19.8 |                      3011 |
+|       2 |             64 |            21.6 |                      5491 |
+|       4 |             64 |            24.1 |                      9802 |
+|       8 |             64 |            28.9 |                     16335 |
+|      16 |             64 |            62.2 |                     14958 |
+
