@@ -56,8 +56,8 @@ struct Options
 typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2SequenceStreamResult>> ClientStream;
 
 
-#define ST_BATCH_SIZE 100      // reads in a gRPC batch
-#define MAX_IN_FLIGHT 40000    // total reads in gRPC system
+#define ST_BATCH_SIZE 2000     // reads in a gRPC batch
+#define MAX_IN_FLIGHT 64000    // total reads in gRPC system
 #define FASTQ_BATCH_SIZE 4000  // reads to read at once from fastq
 #define MAX_BATCHES 64         // number of stream batches to buffer from fastq
 
@@ -176,29 +176,50 @@ public:
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches,
             ClientStream writer) {
         try {
-            while ( finish.wait_for(0s) == std::future_status::timeout || batches->size() > 0) {
+            while (finish.wait_for(0s) == std::future_status::timeout || batches->size() > 0) {
                 std::optional<std::vector<Kraken2SequenceRequest>> item = batches->pop();
                 if (item.has_value()) {
                     std::vector<Kraken2SequenceRequest> batch = item.value();
+                    bool show_msg = true;
                     while (true) {
                         if ((seqs_in_flight + batch.size() >= MAX_IN_FLIGHT)) {
                             std::this_thread::sleep_for(10ms);
-                            std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
+                            if (show_msg) {
+                                show_msg = false;
+                                std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
+                            }
                             continue;
                         }
                         else { break; }
                     }
 
                     // rebatch to smaller batches for stream
+                    const uint64_t MAX_SIZE = 128 * 1024 * 1024;
                     size_t size = (batch.size() - 1) / ST_BATCH_SIZE + 1;
-                    std::cerr << size << " batches of " << ST_BATCH_SIZE << std::endl;
                     for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
                         auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
                         size_t bsize = last - i;
                         Kraken2SequenceRequestMulti req;
                         req.mutable_seqs()->Assign(batch.begin() + i, batch.begin() + last);
-                        writer->Write(req, WriteOptions().set_buffer_hint());
-                        seqs_in_flight.fetch_add(bsize); 
+                        uint64_t msg_size = req.ByteSize();
+                        if (msg_size > MAX_SIZE) {
+                            std::cerr << "Large sequence batch, sending one-by-one." << std::endl;
+                            // send one by one
+                            for (size_t k = i; k<last; ++k) {
+                                Kraken2SequenceRequestMulti req;
+                                req.mutable_seqs()->Assign(batch.begin() + k, batch.begin() + k + 1);
+                                if (req.ByteSize() > MAX_SIZE) {
+                                    std::cerr << "Read is too large! Skipping." << std::endl;
+                                    continue;
+                                }
+                                writer->Write(req, WriteOptions().set_buffer_hint());
+                                seqs_in_flight.fetch_add(1);
+                            }
+                        }
+                        else {
+                            writer->Write(req, WriteOptions().set_buffer_hint());
+                            seqs_in_flight.fetch_add(bsize); 
+                        }
                     }
                 }
             }
@@ -247,7 +268,7 @@ public:
             std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
             while (true) {
                 if ((batches_queue->size() >= MAX_BATCHES)) {
-                    std::cerr << "Waiting before sending more. In-flight: " << batches_queue->size() << "." << std::endl;
+                    std::cerr << "Waiting before reading new read batch." << std::endl;
                     std::this_thread::sleep_for(10ms);
                     continue;
                 }

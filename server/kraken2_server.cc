@@ -157,6 +157,10 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
     builder.SetResourceQuota(rq);
     builder.RegisterService(&service);
+    // allow 128Mb messages
+    builder.SetMaxSendMessageSize(128 * 1024 * 1024);
+    builder.SetMaxMessageSize(128 * 1024 * 1024);
+    builder.SetMaxReceiveMessageSize(128 * 1024 * 1024);
     // Shared pointer so graceful shutdown can be invoked.
     std::shared_ptr<Server> server(builder.BuildAndStart());
     if (server == nullptr) {
