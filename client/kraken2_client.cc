@@ -76,7 +76,6 @@ public:
      * @return else gRPC status code
      */
     int ClassifySequences(const std::string &sequence_name, const std::string &report_file) {
-            //std::vector<Kraken2SequenceRequest> &data) {
         std::cerr << "Classifying sequence stream." << std::endl;
         int state = WaitForServer();
         if (state != 0) {return state;}
@@ -84,47 +83,43 @@ public:
         ClientContext context;
         Kraken2SequenceResultMulti response;
         ClientStream stream(sequence_stub->ClassifyStream(&context));
+        std::atomic<uint64_t> seqs_in_flight = 0;
 
-        // create a queue and thread to read sequences from file, and batch
-        // into gRPC messages for the stream 
+        // queue for gRPC messages (i.e. sequence reads)
         ThreadSafeQueue<std::vector<Kraken2SequenceRequest>>
             *batches_queue = new ThreadSafeQueue<std::vector<Kraken2SequenceRequest>>();
-        std::promise<void> complete;
-        std::future<void> batches_complete = complete.get_future();
-        std::thread batcher_thread(
-            &SequenceClient::FastBatcher, this,
+
+        // reads data from file into queue
+        std::future<int> fastq_batches = std::async(
+            std::launch::async, &SequenceClient::FastBatcher, this,
             std::ref(sequence_name), batches_queue);
 
-        // create a writer and a reader thread, track number of sequences in flight
-        std::atomic<uint64_t> seqs_in_flight = 0;
-        auto write_future = std::async(
+        // take data from queue and send over gRPC
+        std::future<int> stream_batches = std::async(
             std::launch::async, &SequenceClient::StreamWriter, this,
-            std::move(batches_complete),
-            std::ref(seqs_in_flight),
-            batches_queue, stream);
-        auto read_future = std::async(
-            std::launch::async, &SequenceClient::StreamReader, this,
-            std::ref(seqs_in_flight), std::ref(report_file), stream);
+            std::ref(fastq_batches), std::ref(seqs_in_flight),
+            batches_queue, std::ref(stream));
 
-        // wait for all reads to be read;
-        batcher_thread.join();
-        complete.set_value();
-        // wait for writing to finish
-        write_future.wait();
-        int write_rtn = write_future.get();
-        if (write_rtn != EX_OK) {
-            read_future.wait();
-            delete batches_queue;
-            return write_rtn;
-        }
+        // reading back results on gRPC stream
+        std::future<int> recv_reads = std::async(
+            std::launch::async, &SequenceClient::StreamReader, this,
+            std::ref(seqs_in_flight), std::ref(report_file), std::ref(stream));
+
+        // wait for things to finish in order
+        fastq_batches.wait();
+        stream_batches.wait();
+        std::cerr << "Batches: " << fastq_batches.get() << " " << stream_batches.get() << std::endl;
+        recv_reads.wait();
+        std::cerr << "Done waiting" << std::endl;
+
+        delete batches_queue;
+        assert(seqs_in_flight==0);
 
         // Handle the stream response
         Status status = stream->Finish();
         if (!status.ok()) {
             std::cerr << "Client RPC stream failed: " << status.error_message() << std::endl;
         }
-        assert(seqs_in_flight==0);
-        delete batches_queue;
     
         return status.error_code();
     }
@@ -171,12 +166,17 @@ public:
     }
 
     int StreamWriter(
-            std::future<void> finish,
+            std::future<int> &total_batches,
             std::atomic<uint64_t> &seqs_in_flight,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches,
-            ClientStream writer) {
+            ClientStream &writer) {
+        int seqs_sent = 0;
         try {
-            while (finish.wait_for(0s) == std::future_status::timeout || batches->size() > 0) {
+            while (!(
+                // we've finished if we've received the signal AND theres nothing left
+                total_batches.wait_for(0s) == std::future_status::ready
+                && batches->size() == 0
+            )) {
                 std::optional<std::vector<Kraken2SequenceRequest>> item = batches->pop();
                 if (item.has_value()) {
                     std::vector<Kraken2SequenceRequest> batch = item.value();
@@ -192,76 +192,86 @@ public:
                         }
                         else { break; }
                     }
-
+                    
                     // rebatch to smaller batches for stream
                     const uint64_t MAX_SIZE = 128 * 1024 * 1024;
-                    size_t size = (batch.size() - 1) / ST_BATCH_SIZE + 1;
                     for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
                         auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
                         size_t bsize = last - i;
                         Kraken2SequenceRequestMulti req;
                         req.mutable_seqs()->Assign(batch.begin() + i, batch.begin() + last);
-                        uint64_t msg_size = req.ByteSize();
+                        uint64_t msg_size = req.ByteSizeLong();
                         if (msg_size > MAX_SIZE) {
-                            std::cerr << "Large sequence batch, sending one-by-one." << std::endl;
                             // send one by one
                             for (size_t k = i; k<last; ++k) {
                                 Kraken2SequenceRequestMulti req;
                                 req.mutable_seqs()->Assign(batch.begin() + k, batch.begin() + k + 1);
-                                if (req.ByteSize() > MAX_SIZE) {
+                                if (req.ByteSizeLong() > MAX_SIZE) {
                                     std::cerr << "Read is too large! Skipping." << std::endl;
                                     continue;
                                 }
                                 writer->Write(req, WriteOptions().set_buffer_hint());
                                 seqs_in_flight.fetch_add(1);
+                                seqs_sent++;
                             }
                         }
                         else {
-                            writer->Write(req, WriteOptions().set_buffer_hint());
-                            seqs_in_flight.fetch_add(bsize); 
+                            writer->Write(req);
+                            seqs_in_flight.fetch_add(bsize);
+                            seqs_sent += bsize;
                         }
                     }
                 }
             }
-            writer->WritesDone();
         }
         catch (const std::exception &ex) {
             std::cerr << "Failed to send sequences"
                       << ": " << ex.what() << std::endl;
-            return EX_UNAVAILABLE;
+            writer->WritesDone();
+            return seqs_sent;
         }
 
-        std::cerr << "Sent sequences." << std::endl;
-        return EX_OK;
+        // TODO: HORRIBLE HACK
+        //   For some reason, if the original input file contained very few
+        //   reads (~1000), if we do not wait a bit here before calling
+        //   writer->WritesDone() the recv_reads task in the main thread
+        //   hangs and does not complete. I've not observed this with files 
+        //   that contain 4000 reads.
+        std::this_thread::sleep_for(500ms);
+        writer->WritesDone();
+        return seqs_sent;
     }
 
-    void StreamReader(
+    int StreamReader(
             std::atomic<uint64_t> &seqs_in_flight, const std::string &report_file,
-            ClientStream reader) {
+            ClientStream &reader) {
         Kraken2SequenceStreamResult result;
+        int n_reads = 0;
         try {
             while (reader->Read(&result)) {
                 if (result.has_classifications()) {
                     for (auto &res : result.classifications().classes()){
+                        n_reads++;
                         PrintClassification(res);
                         seqs_in_flight--;
                     }
                 }
+                if (result.has_summary())
+                    PrintSummary(result.summary(), report_file);
             }
-            if (result.has_summary())
-                PrintSummary(result.summary(), report_file);
         }
         catch (const std::exception &ex) {
             std::cerr << "Failed to receive responses"
                       << ": " << ex.what() << std::endl;
-            return;
+            return n_reads;
         }
+        return n_reads;
     }
     
     int FastBatcher(
             const std::string &sequence_file,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches_queue) {
-        int total_reads = 0;
+        int n_batches = 0;
         try {
             FastReader reader = FastReader(sequence_file);
         
@@ -276,19 +286,17 @@ public:
                 std::vector<Kraken2SequenceRequest> seqs;
                 int n_reads;
                 if ((n_reads = reader.read(seqs, FASTQ_BATCH_SIZE)) > 0) {
-                    total_reads += n_reads;
+                    n_batches++;
                     batches_queue->push(std::move(seqs));
                 }
                 else { break; }
             }
-            std::cerr << "Finished reading " << total_reads << " sequences." << std::endl;
         }
         catch (const std::exception &ex) {
             std::cerr << "Failed to read sequences from file: " << sequence_file
                       << ": " << ex.what() << std::endl;
-            return total_reads;
         }
-        return total_reads;
+        return n_batches;
     }
 
 

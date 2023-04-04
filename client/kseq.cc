@@ -6,7 +6,9 @@
 FastReader::FastReader(std::string filename)
 {
     m_filename = filename;
-    gzFile m_fp = gzopen(filename.c_str(), "r");
+    FILE *instream = NULL;
+    instream = (filename == "-") ? stdin : fopen(filename.c_str(), "r");
+    gzFile m_fp = gzdopen(fileno(instream), "r");
     m_seq = kseq_init(m_fp);
 }
 
