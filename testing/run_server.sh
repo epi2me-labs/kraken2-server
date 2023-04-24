@@ -57,8 +57,10 @@ function run() {
     port=$2
     client=$3
     echo "$input, $port, $client"
-    time kraken2_client --report "kraken.stream.report" --sequence $input  --port $port --host-ip 127.0.0.1 > tmp$client
+    time kraken2_client --report "kraken.stream.report" --sequence $input  --port $port --host-ip 127.0.0.1 > tmp$client 2> log$client
     #cat tmp$client | sort -k 2 > client-$client.stream.classifications.fasta.txt
+    echo "client $3 finished" >> log$client
+    echo "client $3 finished"
 }
 export -f run
 

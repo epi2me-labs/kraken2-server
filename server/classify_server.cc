@@ -83,7 +83,8 @@ void ResultsHandler(
 void Kraken2ServerClassifier::ProcessSequenceStream(
         ServerContext *context, ServerStream *stream, std::string &results) {
     std::cerr << "Starting stream handler." << std::endl;
-    
+    stream->SendInitialMetadata();
+
     // Stats for the whole stream
     taxon_counters_t stream_taxon_counters;
     ClassificationStats stream_stats = {0, 0, 0};

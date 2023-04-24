@@ -101,9 +101,6 @@ public:
 
         std::string results;
 
-        std::promise<void> complete;
-        std::future<void> reads_complete = complete.get_future();
-
         classifier->ProcessSequenceStream(context, reader_writer, std::ref(results));
 
         // If connection is open, send a final message containing the summary.

@@ -4,6 +4,7 @@
 #include <fstream>
 #include <future>
 #include <getopt.h>
+#include <random>
 #include <thread>
 #include <sysexits.h>
 
@@ -231,13 +232,6 @@ public:
             return seqs_sent;
         }
 
-        // TODO: HORRIBLE HACK
-        //   For some reason, if the original input file contained very few
-        //   reads (~1000), if we do not wait a bit here before calling
-        //   writer->WritesDone() the recv_reads task in the main thread
-        //   hangs and does not complete. I've not observed this with files 
-        //   that contain 4000 reads.
-        std::this_thread::sleep_for(500ms);
         writer->WritesDone();
         return seqs_sent;
     }
