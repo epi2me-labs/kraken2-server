@@ -17,7 +17,7 @@ The software is currently a public beta release.
 The kraken2 server and client are available through our conda channel:
 
 ```
-mamba create -n kraken2 -c conda-forge -c epi2melabs kraken2-server
+mamba create -n kraken2 -c conda-forge -c nanoporetech kraken2-server
 ```
 
 ## Usage
