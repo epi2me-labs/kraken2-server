@@ -25,6 +25,7 @@ deploy-checks:
     script:
         # TODO: store a version in code somewhere and check
         - !reference [.check, changelog]
+        - !reference [.check, license]
     rules:
         - if: '$CI_COMMIT_TAG =~ /^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$/'
 
