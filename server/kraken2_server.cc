@@ -327,7 +327,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 break;
             case 'o':
             case 'O':
-                opts.use_translated_search = true;
+                opts.use_memory_mapping = true;
                 break;
             case 'w':
             case 'W':
