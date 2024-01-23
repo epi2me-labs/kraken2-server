@@ -65,6 +65,10 @@ void ResultsHandler(
         std::optional<BatchResults> res = results_queue->pop();
         if (res.has_value()) {
             // put the results in the stream
+            // We're assuming the client can receive arbitrarily large messages.
+            // That's fine for now as the client is set to recieve INT_MAX. We could
+            // instead send reads back one by one if the message is large. (Requires
+            // some rejigging of struct in results queue first).
             Kraken2SequenceStreamResult result;
             *(result.mutable_classifications()) = res->k2results;
             stream->Write(result, WriteOptions().set_buffer_hint()); 
