@@ -109,11 +109,12 @@ public:
         // wait for things to finish in order
         fastq_batches.wait();
         stream_batches.wait();
-        std::cerr << "Batches: " << fastq_batches.get() << " " << stream_batches.get() << std::endl;
         recv_reads.wait();
         std::cerr << "Done waiting" << std::endl;
 
         delete batches_queue;
+        std::cerr << "Sent    : " << stream_batches.get() << std:: endl;
+        std::cerr << "Received: " << recv_reads.get() << std::endl;
         assert(seqs_in_flight==0);
 
         // Handle the stream response
@@ -250,8 +251,12 @@ public:
                         seqs_in_flight--;
                     }
                 }
-                if (result.has_summary())
+                else if (result.has_summary()) {
                     PrintSummary(result.summary(), report_file);
+                }
+                else {
+                    std::cerr << "Result had neither classifications or summary :/" << std::endl;
+                }
             }
         }
         catch (const std::exception &ex) {
@@ -446,7 +451,18 @@ int main(int argc, char **argv) {
     std::string server_address = opts.host + ":" + std::to_string(opts.port);
 
     std::cerr << "Connecting to server: " << server_address << "." << std::endl;
-    SequenceClient client(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()));
+
+    // when we send messages from the client we break up sequence
+    // batches to stay below 128Mb message size as set up in kraken2_server.cc
+    // We need to similarly ensure the the client can receive more than the
+    // default 4MB message size. Just set it to the max
+    grpc::ChannelArguments ch_args;
+    ch_args.SetMaxReceiveMessageSize(INT_MAX);
+    std::shared_ptr<grpc::Channel> ch =
+        grpc::CreateCustomChannel(
+            server_address,
+            grpc::InsecureChannelCredentials(), ch_args);
+    SequenceClient client(ch);
 
     if (opts.shutdown) {
         rtn_code = client.ShutdownServer();
