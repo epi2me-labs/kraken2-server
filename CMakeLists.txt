@@ -1,3 +1,7 @@
+###
+# There are hinst below to look for gRPC and Protobuf libraries in the
+# proto-build directory as per the instruction in the README.md file.
+
 # The minimum permitted CMake version
 cmake_minimum_required(VERSION 3.13)
 
@@ -14,7 +18,8 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
-find_package(Protobuf CONFIG REQUIRED)
+find_package(Protobuf CONFIG REQUIRED
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build")
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 
 ## Set a variable which points to a library installed on machine - Protobuf
@@ -30,8 +35,12 @@ else()
     set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
 endif()
 
+# Find Abseil before gRPC
+find_package(absl CONFIG REQUIRED PATHS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build/lib/cmake/absl")
+
 # Locate and verify version of gRPC
-find_package(gRPC CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build" )
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
 # Set a variable which points to a library installed on machine - gRPC for C++
