@@ -43,6 +43,7 @@ message Kraken2SequenceRequest {
   string id = 3;
   string seq = 4;
   string quals = 5;
+  // Deprecated: no longer sent or read, kept so older clients and servers interoperate.
   string str_representation = 6;
 }
 

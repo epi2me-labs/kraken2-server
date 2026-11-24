@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- Tests: synthetic DNA (32 and 40 bit cell) and protein databases, comparison with
+  upstream `classify`, a multi-client check, and a gRPC error-path test
+  (`testing/run_all_checks.sh`).
+### Changed
+- gRPC and protobuf are taken from conda-forge packages in the conda recipe and
+  CI, rather than built from source. Builds with libgrpc 1.85.
+- Updated to kraken2 commit 8d0e7ad (v2.18.0-RC2). Per-read classifications and
+  reports match the upstream `classify` program (see `testing/compare_with_kraken2.sh`).
+  Databases with 40-bit hash cells are now supported.
+- The database loads in the background, so the server accepts connections
+  immediately and tells clients to wait until it is ready.
+- Invalid command line options now exit with a non-zero status and a usage message.
+  Values are validated strictly. Upper case long options (e.g. `--DB`) are no longer
+  accepted; upper case short options still are.
+- The server exits non-zero if it cannot start (e.g. port in use) or the database
+  cannot be loaded.
+- The client no longer sends each read a second time as text (`str_representation`).
+- The client polls a loading server every 2s rather than 10s.
+### Fixed
+- Classification no longer spins a CPU waiting for results; throughput is much higher.
+- A read with mismatched sequence and quality lengths failed the stream with
+  INVALID_ARGUMENT rather than killing the server.
+- `-i`, `-t` and `-w` options were rejected as invalid.
+- The server shuts down cleanly on repeated SIGINT/SIGTERM, instead of
+  crashing on the second signal.
+- Race on the summary returned by the server.
+- Client crash when closing its input file, and when the input file did not exist.
+  The client now exits with an error if its input cannot be read or is malformed.
+### Removed
+- Unused utility code and the unused `thread_pool_light.hpp`.
+
 ## [v0.1.8]
 ### Fixed
 - Receive size of messages in client raised to accomodate larger requests.

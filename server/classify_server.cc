@@ -1,91 +1,132 @@
+#include <cerrno>
+#include <cstring>
 #include <fstream>
-#include <getopt.h>
+#include <stdexcept>
 #include <thread>
-#include <sysexits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "classify_server.h"
 #include "messages.h"
 
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
 
-Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
-        : opts(options),
-            taxonomy(opts.taxonomy_filename, opts.use_memory_mapping),
-            hash(opts.index_filename, opts.use_memory_mapping) {
-    // start a thread pool to handle classification tasks and
-    // start loading the index. Should probably do better to
-    // handle errors in LoadIndex
+Kraken2ServerClassifier::Kraken2ServerClassifier(const Options &options)
+        : opts(options) {
     std::cout << "Creating classification thread pool with "
               << opts.thread_pool << " thread(s)." << std::endl;
     pool.reset(opts.thread_pool);
-    std::thread loader([this]() { LoadIndex(); });
-    loader.detach();
+    // Start loading the index, the server can accept connections meanwhile
+    // and tell clients to wait.
+    loader_ = std::thread([this]() { LoadIndex(); });
 }
 
 
-Kraken2ServerClassifier::~Kraken2ServerClassifier(){
-    // Any deconstruction
+Kraken2ServerClassifier::~Kraken2ServerClassifier() {
+    if (loader_.joinable())
+        loader_.join();
 }
 
 
-const char *Kraken2ServerClassifier::GetSummary() { return summary.c_str(); }
+std::string Kraken2ServerClassifier::GetSummary() const {
+    std::lock_guard<std::mutex> lock(stats_mtx);
+    return summary;
+}
+
+
+namespace
+{
+void RequireReadable(const std::string &filename) {
+    if (access(filename.c_str(), R_OK) != 0)
+        throw std::runtime_error("cannot read " + filename + ": " + strerror(errno));
+}
+} // namespace
 
 
 void Kraken2ServerClassifier::LoadIndex() {
-    index_available = false;
     std::cerr << "Loading database information..." << std::endl;
+    // Delays loading, for testing clients that wait for the server.
     std::this_thread::sleep_for(std::chrono::seconds(opts.wait));
 
     try {
-        idx_opts = {0};
-        ifstream idx_opt_fs(opts.options_filename);
+        RequireReadable(opts.options_filename);
+        RequireReadable(opts.taxonomy_filename);
+        RequireReadable(opts.index_filename);
+
         struct stat sb;
         if (stat(opts.options_filename.c_str(), &sb) < 0)
-            throw std::runtime_error("Unable to get filesize of index file.");
-        auto opts_filesize = sb.st_size;
-        idx_opt_fs.read((char *)&idx_opts, opts_filesize);
+            throw std::runtime_error("unable to get size of " + opts.options_filename);
+        if (static_cast<size_t>(sb.st_size) != sizeof(IndexOptions))
+            throw std::runtime_error(
+                opts.options_filename + " is not the size expected of a database options file");
+        idx_opts = {0};
+        std::ifstream idx_opt_fs(opts.options_filename, std::ios::binary);
+        if (!idx_opt_fs.read(reinterpret_cast<char *>(&idx_opts), sizeof(idx_opts)))
+            throw std::runtime_error("unable to read " + opts.options_filename);
+        // The database dictates whether translated search is used.
         opts.use_translated_search = !idx_opts.dna_db;
+        // Required before any translation: upstream's tables are empty until
+        // this is called (kraken2's classify calls it at the start of a run).
+        initLookUpTables();
+
+        taxonomy.reset(new Taxonomy(opts.taxonomy_filename, opts.use_memory_mapping));
+        // Upstream databases come with either 32 or 40 bit cells.
+        switch (GetKVStoreCellType(opts.index_filename)) {
+        case CompactHash32:
+            hash.reset(new CompactHashTable<CompactHashCell>(
+                opts.index_filename, opts.use_memory_mapping));
+            break;
+        case CompactHash40:
+            hash.reset(new CompactHashTable<CompactHashCell40>(
+                opts.index_filename, opts.use_memory_mapping));
+            break;
+        default:
+            throw std::runtime_error("unable to determine width of compact hash cell");
+        }
     }
     catch (const std::exception &ex) {
         std::cerr << "Unable to load index"
                   << ": " << ex.what() << std::endl;
-        index_broken = true;
+        state_ = IndexState::Failed;
         return;
     }
     std::cerr << "Successfully loaded index." << std::endl;
-    index_available = true;
+    state_ = IndexState::Ready;
 }
 
+
+namespace
+{
+// Writes classifications back to the client as batches complete, and
+// accumulates the stream's statistics. Runs until the queue is closed and
+// drained.
 void ResultsHandler(
-        ServerStream *stream, std::future<void> finish,
+        ServerStream *stream,
+        ThreadSafeQueue<BatchResults> *results_queue,
         taxon_counters_t &stream_taxon_counters,
-        ClassificationStats &stream_stats,
-        ThreadSafeQueue<BatchResults> *results_queue) {
-    while (finish.wait_for(0s) == std::future_status::timeout) {
-        std::optional<BatchResults> res = results_queue->pop();
-        if (res.has_value()) {
-            // put the results in the stream
+        ClassificationStats &stream_stats) {
+    bool client_writable = true;
+    while (auto res = results_queue->pop()) {
+        if (client_writable) {
             // We're assuming the client can receive arbitrarily large messages.
-            // That's fine for now as the client is set to recieve INT_MAX. We could
-            // instead send reads back one by one if the message is large. (Requires
-            // some rejigging of struct in results queue first).
+            // That's fine for now as the client is set to receive INT_MAX.
             Kraken2SequenceStreamResult result;
-            *(result.mutable_classifications()) = res->k2results;
-            stream->Write(result, WriteOptions().set_buffer_hint()); 
-            // update stats for the stream
-            stream_stats.total_bases += res->stats.total_bases;
-            stream_stats.total_classified += res->stats.total_classified;
-            stream_stats.total_sequences += res->stats.total_sequences;
-            // update taxon_counters for the stream
-            for (auto &kv_pair : res->taxon_counters) {
-                stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
-            }
+            result.mutable_classifications()->Swap(&res->k2results);
+            // Keep draining if the client has gone, so the statistics stay correct.
+            client_writable = stream->Write(result, WriteOptions().set_buffer_hint());
+        }
+        stream_stats.total_bases += res->stats.total_bases;
+        stream_stats.total_classified += res->stats.total_classified;
+        stream_stats.total_sequences += res->stats.total_sequences;
+        for (auto &kv_pair : res->taxon_counters) {
+            stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
         }
     }
 }
+} // namespace
 
-void Kraken2ServerClassifier::ProcessSequenceStream(
-        ServerContext *context, ServerStream *stream, std::string &results) {
+grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
+        ServerContext *context, ServerStream *stream, std::string &report) {
     std::cerr << "Starting stream handler." << std::endl;
     stream->SendInitialMetadata();
 
@@ -96,76 +137,90 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     struct timeval tv1, tv2;
     gettimeofday(&tv1, nullptr);
 
-    // create a queue and associated thread to aggregate the results of batches
-    // and post to our output stream
-    ThreadSafeQueue<BatchResults> *results_queue = new ThreadSafeQueue<BatchResults>();
-    std::promise<void> complete;
-    std::future<void> batches_complete = complete.get_future();
+    // Batches are classified on the shared pool, and a thread aggregates the
+    // results and posts them to the output stream.
+    ThreadSafeQueue<BatchResults> results_queue;
+    StreamFailure failure;
     std::thread results_thread(ResultsHandler,
-        stream, std::move(batches_complete),
-        std::ref(stream_taxon_counters), std::ref(stream_stats), results_queue);
+        stream, &results_queue,
+        std::ref(stream_taxon_counters), std::ref(stream_stats));
 
-    // Classify while reads are still being received on the input stream
-    Kraken2SequenceRequestMulti req;
-    std::vector<Kraken2SequenceRequest> seq_batch;
-    std::vector<std::future<bool>> futures;
-    while (!context->IsCancelled() && stream->Read(&req)) {
-        // We could rebatch here, for now just pass the batch as is.
-        futures.push_back(
-            pool.submit(
-                &Kraken2ServerClassifier::ProcessBatch, this,
-                std::move(req), results_queue));
+    std::vector<std::future<void>> futures;
+    try {
+        // Classify while reads are still being received on the input stream
+        Kraken2SequenceRequestMulti req;
+        while (!context->IsCancelled() && !failure.failed() && stream->Read(&req)) {
+            // We could rebatch here, for now just pass the batch as is.
+            futures.push_back(pool.submit(
+                [this, batch = std::move(req), &results_queue, &failure]() mutable {
+                    ProcessBatch(std::move(batch), &results_queue, &failure);
+                }));
+        }
+        for (auto &fut : futures) { fut.get(); }
     }
-
-    // wait for all futures to resolve, then wait for the queue to be empty,
-    // and finally tell the results thread to finish
-    for (auto &fut : futures) { fut.get(); }
-    while (results_queue->size() > 0) {}
-    complete.set_value();
+    catch (...) {
+        // The results thread must be joined before it is destroyed.
+        for (auto &fut : futures) { if (fut.valid()) fut.wait(); }
+        results_queue.close();
+        results_thread.join();
+        throw;
+    }
+    // Every batch is done, so the queue holds everything there will be.
+    results_queue.close();
     results_thread.join();
 
     gettimeofday(&tv2, nullptr);
-    // generate the report, and update servers total history
-    GenerateReport(
-        results, summary, opts, taxonomy, tv1, tv2, stream_stats, total_stats,
-        stream_taxon_counters, total_taxon_counters, stats_mtx);
+    if (failure.failed()) {
+        std::cerr << "Stream failed: " << failure.message() << std::endl;
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, failure.message());
+    }
 
-    delete results_queue;
+    // generate the report, and update the server's total history
+    GenerateReport(report, tv1, tv2, stream_stats, stream_taxon_counters);
     std::cerr << "Finished stream handler." << std::endl;
+    return grpc::Status::OK;
 }
 
 
-bool Kraken2ServerClassifier::ProcessBatch(
+void Kraken2ServerClassifier::ProcessBatch(
     Kraken2SequenceRequestMulti reqs,
-    ThreadSafeQueue<BatchResults> *result_q) {
+    ThreadSafeQueue<BatchResults> *result_q,
+    StreamFailure *failure) {
+    try {
+        if (failure->failed())
+            return;
 
-    MinimizerScanner scanner(
-        idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
-        idx_opts.dna_db, idx_opts.toggle_mask,
-        idx_opts.revcom_version);
-    vector<taxid_t> taxa;
-    taxon_counts_t hit_counts;
-    vector<string> translated_frames(6);
+        MinimizerScanner scanner(
+            idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+            idx_opts.dna_db, idx_opts.toggle_mask,
+            idx_opts.revcom_version);
+        vector<taxid_t> taxa;
+        taxon_counts_t hit_counts;
+        vector<string> translated_frames(6);
 
-    BatchResults results = BatchResults();
+        BatchResults results;
 
-    kraken2::Sequence seq;
-    for (auto &req : reqs.seqs()) {
-        SequenceRequestToSequence(req, seq);
-        results.stats.total_sequences++;
-        results.stats.total_bases += seq.seq.size();
-        if (opts.minimum_quality_score > 0)
-            MaskLowQualityBases(seq, opts.minimum_quality_score);
+        Sequence seq;
+        for (auto &req : reqs.seqs()) {
+            SequenceRequestToSequence(req, seq);
+            results.stats.total_sequences++;
+            results.stats.total_bases += seq.seq.size();
+            if (opts.minimum_quality_score > 0)
+                MaskLowQualityBases(seq, opts.minimum_quality_score);
 
-        Kraken2SequenceResult classification = ClassifySequence(
-            seq, hash, taxonomy, idx_opts, opts, results.stats, scanner,
-            taxa, hit_counts, translated_frames, results.taxon_counters);
+            results.k2results.mutable_classes()->Add(ClassifySequence(
+                seq, hash.get(), *taxonomy, idx_opts, opts, results.stats, scanner,
+                taxa, hit_counts, translated_frames, results.taxon_counters));
+        }
 
-        results.k2results.mutable_classes()->Add(std::move(classification));
+        result_q->push(std::move(results));
     }
-
-    result_q->push(std::move(results));
-    return true;
+    catch (const std::exception &ex) {
+        failure->Set(ex.what());
+    }
+    catch (...) {
+        failure->Set("unknown error while classifying");
+    }
 }
 
 
@@ -175,61 +230,122 @@ bool Kraken2ServerClassifier::ProcessBatch(
 ////////////////////////////////
 
 void Kraken2ServerClassifier::AddHitlistString(
-    ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
+    std::string &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
 {
-    auto last_code = taxa[0];
-    auto code_count = 1;
-
-    for (size_t i = 1; i < taxa.size(); i++)
+    // taxa holds run-length encoded (code, count) pairs
+    for (size_t i = 0; i + 1 < taxa.size(); i += 2)
     {
         auto code = taxa[i];
-
-        if (code == last_code)
+        auto count = std::to_string(taxa[i + 1]);
+        if (code != MATE_PAIR_BORDER_TAXON && code != READING_FRAME_BORDER_TAXON)
         {
-            code_count += 1;
-        }
-        else
-        {
-            if (last_code != MATE_PAIR_BORDER_TAXON && last_code != READING_FRAME_BORDER_TAXON)
+            if (code == AMBIGUOUS_SPAN_TAXON)
             {
-                if (last_code == AMBIGUOUS_SPAN_TAXON)
-                {
-                    oss << "A:" << code_count << " ";
-                }
-                else
-                {
-                    auto ext_code = taxonomy.nodes()[last_code].external_id;
-                    oss << ext_code << ":" << code_count << " ";
-                }
+                oss += "A:" + count + " ";
             }
             else
-            { // mate pair/reading frame marker
-                oss << (last_code == MATE_PAIR_BORDER_TAXON ? "|:| " : "-:- ");
+            {
+                oss += std::to_string(taxonomy.nodes()[code].external_id) + ":" + count + " ";
             }
-            code_count = 1;
-            last_code = code;
-        }
-    }
-    if (last_code != MATE_PAIR_BORDER_TAXON && last_code != READING_FRAME_BORDER_TAXON)
-    {
-        if (last_code == AMBIGUOUS_SPAN_TAXON)
-        {
-            oss << "A:" << code_count << " ";
         }
         else
-        {
-            auto ext_code = taxonomy.nodes()[last_code].external_id;
-            oss << ext_code << ":" << code_count;
+        { // mate pair/reading frame marker
+            oss += (code == MATE_PAIR_BORDER_TAXON ? "|:| " : "-:- ");
         }
     }
-    else
-    { // mate pair/reading frame marker
-        oss << (last_code == MATE_PAIR_BORDER_TAXON ? "|:|" : "-:-");
-    }
+    if (!oss.empty() && oss.back() == ' ')
+        oss.pop_back();
 }
 
+namespace
+{
+// Adapted from MinimizerLookups in kraken2/src/classify.cc (not exported in a
+// header upstream). Minimizers are looked up in batches and the resulting
+// taxa run-length encoded as (taxon, count) pairs. Quick mode and the
+// unique-minimizer flag have been removed.
+struct MinimizerLookups
+{
+    MinimizerLookups(KeyValueStore *hash, std::vector<taxid_t> &taxa,
+                     taxon_counters_t &counters, taxon_counts_t &hit_counts,
+                     std::vector<LookupData> &lookup_buffer,
+                     bool write_minimizer_data)
+        : _hash(hash), _taxa(taxa), _taxon_counters(counters),
+          _hit_counts(hit_counts), lookup_keys(lookup_buffer),
+          _minimizer_hit_groups(0), _previous_minimizer(UINT64_MAX),
+          _write_minimizer_data(write_minimizer_data)
+    {
+        lookup_keys.reserve(batch_size);
+    }
+
+    inline void add_data(uint64_t minimizer, taxid_t taxid)
+    {
+        lookup_keys.push_back({minimizer, taxid});
+        if (lookup_keys.size() == batch_size)
+            get_batch();
+    }
+
+    inline void get_batch()
+    {
+        if (lookup_keys.empty())
+            return;
+        _hash->GetBatch(lookup_keys);
+        taxid_t previous_taxid = TAXID_MAX;
+        if (_taxa.size() > 0)
+            previous_taxid = _taxa[_taxa.size() - 2];
+
+        for (size_t i = 0; i < lookup_keys.size(); i++)
+        {
+            bool repeat = lookup_keys[i].key == _previous_minimizer;
+            // A hit can repeat a minimizer that missed. A border, or a
+            // minimizer the database sampled away, ends a run of repeats; an
+            // ambiguous span does not.
+            if (lookup_keys[i].key != UINT64_MAX)
+                _previous_minimizer = lookup_keys[i].key;
+            else if (lookup_keys[i].value != AMBIGUOUS_SPAN_TAXON)
+                _previous_minimizer = UINT64_MAX;
+            if (lookup_keys[i].key != UINT64_MAX && lookup_keys[i].value > 0)
+            {
+                _hit_counts[lookup_keys[i].value] += 1;
+                if (!repeat)
+                {
+                    _minimizer_hit_groups += 1;
+                    if (_write_minimizer_data)
+                        _taxon_counters[lookup_keys[i].value].add_kmer(lookup_keys[i].key);
+                }
+                else if (_write_minimizer_data)
+                {
+                    _taxon_counters[lookup_keys[i].value].increaseKmerCount(1);
+                }
+            }
+            taxid_t taxid = lookup_keys[i].value;
+            if (previous_taxid != taxid)
+            {
+                _taxa.push_back(taxid);
+                _taxa.push_back(1);
+            }
+            else
+            {
+                _taxa.back() += 1;
+            }
+            previous_taxid = taxid;
+        }
+        lookup_keys.resize(0);
+    }
+
+    KeyValueStore *_hash;
+    std::vector<taxid_t> &_taxa;
+    taxon_counters_t &_taxon_counters;
+    taxon_counts_t &_hit_counts;
+    std::vector<LookupData> &lookup_keys;
+    int64_t _minimizer_hit_groups;
+    uint64_t _previous_minimizer;
+    bool _write_minimizer_data;
+    static const size_t batch_size = 1024;
+};
+} // namespace
+
 Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
-    Sequence &dna, CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+    Sequence &dna, KeyValueStore *hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
     Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
     vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
     vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts)
@@ -239,81 +355,59 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
     taxa.clear();
     hit_counts.clear();
     auto frame_ct = opts.use_translated_search ? 6 : 1;
-    int64_t minimizer_hit_groups = 0;
+    size_t total_kmers = 0;
+
+    // Only the batch buffer outlives the read, so it is allocated once per thread.
+    static thread_local std::vector<LookupData> lookup_buffer;
+    MinimizerLookups lookups(
+        hash, taxa, curr_taxon_counts, hit_counts, lookup_buffer,
+        opts.report_kmer_data);
 
     if (opts.use_translated_search)
     {
-        TranslateToAllFrames(dna.seq, tx_frames);
+        TranslateToAllFrames(dna.seq.data(), dna.seq.size(), tx_frames);
     }
     // index of frame is 0 - 5 w/ tx search (or 0 if no tx search)
     for (int frame_idx = 0; frame_idx < frame_ct; frame_idx++)
     {
         if (opts.use_translated_search)
-        {
             scanner.LoadSequence(tx_frames[frame_idx]);
-        }
         else
-        {
-            scanner.LoadSequence(dna.seq);
-        }
-        uint64_t last_minimizer = UINT64_MAX;
-        taxid_t last_taxon = TAXID_MAX;
+            scanner.LoadSequence(dna.seq.data(), dna.seq.size());
+
         while ((minimizer_ptr = scanner.NextMinimizer()) != nullptr)
         {
-            taxid_t taxon;
             if (scanner.is_ambiguous())
             {
-                taxon = AMBIGUOUS_SPAN_TAXON;
+                lookups.add_data(UINT64_MAX, AMBIGUOUS_SPAN_TAXON);
             }
             else
             {
-                if (*minimizer_ptr != last_minimizer)
+                if (idx_opts.minimum_acceptable_hash_value)
                 {
-                    bool skip_lookup = false;
-                    if (idx_opts.minimum_acceptable_hash_value)
-                    {
-                        if (MurmurHash3(*minimizer_ptr) < idx_opts.minimum_acceptable_hash_value)
-                            skip_lookup = true;
-                    }
-                    taxon = 0;
-                    if (!skip_lookup)
-                        taxon = hash.Get(*minimizer_ptr);
-                    last_taxon = taxon;
-                    last_minimizer = *minimizer_ptr;
-                    // Increment this only if (a) we have DB hit and
-                    // (b) minimizer != last minimizer
-
-                    if (taxon)
-                    {
-                        minimizer_hit_groups++;
-                        // New minimizer should trigger registering minimizer in RC/HLL
-                        curr_taxon_counts[taxon].add_kmer(scanner.last_minimizer());
-                    }
+                    if (MurmurHash3(*minimizer_ptr) < idx_opts.minimum_acceptable_hash_value)
+                        *minimizer_ptr = UINT64_MAX;
                 }
-                else
-                {
-                    taxon = last_taxon;
-                }
-                if (taxon)
-                {
-                    hit_counts[taxon]++;
-                }
+                lookups.add_data(*minimizer_ptr, 0);
             }
-            taxa.push_back(taxon);
+            total_kmers += 1;
         }
+        lookups.get_batch();
         if (opts.use_translated_search && frame_idx != 5)
-            taxa.push_back(READING_FRAME_BORDER_TAXON);
+            lookups.add_data(UINT64_MAX, READING_FRAME_BORDER_TAXON);
     }
 
-    delete minimizer_ptr;
+    // The report always needs every taxon with a hit to have a counter, even
+    // when no k-mer data is kept.
+    if (!lookups._write_minimizer_data)
+    {
+        for (auto &kv_pair : hit_counts)
+            curr_taxon_counts[kv_pair.first];
+    }
 
-    auto total_kmers = taxa.size();
-
-    if (opts.use_translated_search) // account for reading frame markers
-        total_kmers -= 2;
     call = ResolveTree(hit_counts, taxonomy, total_kmers, opts);
     // Void a call made by too few minimizer groups
-    if (call && minimizer_hit_groups < opts.minimum_hit_groups)
+    if (call && lookups._minimizer_hit_groups < opts.minimum_hit_groups)
         call = 0;
 
     if (call)
@@ -337,9 +431,9 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
         result.set_hitlist("0:0");
     else
     {
-        std::ostringstream hitlist;
+        std::string hitlist;
         AddHitlistString(hitlist, taxa, taxonomy);
-        result.set_hitlist(hitlist.str());
+        result.set_hitlist(hitlist);
     }
 
     return result;
@@ -350,8 +444,9 @@ void Kraken2ServerClassifier::MaskLowQualityBases(Sequence &dna, int minimum_qua
     if (dna.format != FORMAT_FASTQ)
         return;
     if (dna.seq.size() != dna.quals.size())
-        errx(EX_DATAERR, "%s: Sequence length (%d) != Quality string length (%d)",
-             dna.id.c_str(), (int)dna.seq.size(), (int)dna.quals.size());
+        throw std::invalid_argument(
+            dna.id + ": sequence length (" + std::to_string(dna.seq.size()) +
+            ") != quality string length (" + std::to_string(dna.quals.size()) + ")");
     for (size_t i = 0; i < dna.seq.size(); i++)
     {
         if ((dna.quals[i] - '!') < minimum_quality_score)
@@ -361,65 +456,120 @@ void Kraken2ServerClassifier::MaskLowQualityBases(Sequence &dna, int minimum_qua
 
 
 taxid_t Kraken2ServerClassifier::ResolveTree(taxon_counts_t &hit_counts,
-                                             Taxonomy &taxonomy, size_t total_minimizers, Options &opts)
+    Taxonomy &taxonomy, size_t total_minimizers, Options &opts)
 {
-    taxid_t max_taxon = 0;
-    uint32_t max_score = 0;
-    uint32_t required_score = ceil(opts.confidence_threshold * total_minimizers);
+  taxid_t max_taxon = 0;
+  uint32_t max_score = 0;
+  uint32_t required_score = ceil(opts.confidence_threshold * total_minimizers);
+  const size_t hit_count = hit_counts.size();
 
-    // Sum each taxon's LTR path, find taxon with highest LTR score
-    for (auto &kv_pair : hit_counts)
-    {
-        taxid_t taxon = kv_pair.first;
-        uint32_t score = 0;
+  // With one hit, every ancestor has exactly the same clade support. No
+  // parent walk or confidence scratch allocation can change the answer.
+  if (hit_count == 1) {
+    const auto &hit = *hit_counts.begin();
+    return hit.first && static_cast<uint32_t>(hit.second) >= required_score
+        ? hit.first : 0;
+  }
 
-        for (auto &kv_pair2 : hit_counts)
-        {
-            taxid_t taxon2 = kv_pair2.first;
+  // Parents have smaller internal IDs. Stop a candidate's parent walk once
+  // it is below every hit ID. For two hits, one ancestor test per candidate
+  // avoids a hash lookup at each intervening parent on a long sparse chain.
+  taxid_t min_hit_taxon = TAXID_MAX;
+  if (hit_count > 2)
+    for (const auto &hit : hit_counts)
+      if (hit.first && hit.first < min_hit_taxon)
+        min_hit_taxon = hit.first;
 
-            if (taxonomy.IsAAncestorOfB(taxon2, taxon))
-            {
-                score += kv_pair2.second;
-            }
-        }
-
-        if (score > max_score)
-        {
-            max_score = score;
-            max_taxon = taxon;
-        }
-        else if (score == max_score)
-        {
-            max_taxon = taxonomy.LowestCommonAncestor(max_taxon, taxon);
-        }
+  // Sum direct hits on each candidate's parent chain instead of comparing
+  // every pair of hit taxa. Expected O(DH), with no extra scoring storage.
+  // Keep candidate iteration order and uint32_t score arithmetic unchanged.
+  for (auto &kv_pair : hit_counts) {
+    taxid_t taxon = kv_pair.first;
+    uint32_t score = taxon ? kv_pair.second : 0;
+    if (hit_count == 2) {
+      for (const auto &hit : hit_counts)
+        if (hit.first != taxon && taxonomy.IsAAncestorOfB(hit.first, taxon))
+          score += hit.second;
+    } else {
+      for (taxid_t ancestor = taxonomy.nodes()[taxon].parent_id;
+           ancestor && ancestor >= min_hit_taxon;
+           ancestor = taxonomy.nodes()[ancestor].parent_id) {
+        const auto hit = hit_counts.find(ancestor);
+        if (hit != hit_counts.end())
+          score += hit->second;
+      }
     }
 
-    // Reset max. score to be only hits at the called taxon
-    max_score = hit_counts[max_taxon];
-    // We probably have a call w/o required support (unless LCA resolved tie)
-    while (max_taxon && max_score < required_score)
-    {
-        max_score = 0;
-        for (auto &kv_pair : hit_counts)
-        {
-            taxid_t taxon = kv_pair.first;
-            // Add to score if taxon in max_taxon's clade
-            if (taxonomy.IsAAncestorOfB(max_taxon, taxon))
-            {
-                max_score += kv_pair.second;
-            }
-        }
-        // Score is now sum of hits at max_taxon and w/in max_taxon clade
-        if (max_score >= required_score)
-            // Kill loop and return, we've got enough support here
-            return max_taxon;
-        else
-            // Run up tree until confidence threshold is met
-            // Run off tree if required score isn't met
-            max_taxon = taxonomy.nodes()[max_taxon].parent_id;
+    if (score > max_score) {
+      max_score = score;
+      max_taxon = taxon;
     }
+    else if (score == max_score) {
+      max_taxon = taxonomy.LowestCommonAncestor(max_taxon, taxon);
+    }
+  }
 
+  // Reset max. score to be only hits at the called taxon
+  max_score = hit_counts[max_taxon];
+  if (!max_taxon || max_score >= required_score)
     return max_taxon;
+
+  // With two hits, support changes at no more than two intersections. Keep
+  // those on the stack instead of allocating a whole ancestor chain.
+  if (hit_count == 2) {
+    std::pair<taxid_t, uint32_t> junctions[2] = {};
+    size_t count = 0;
+    for (const auto &hit : hit_counts) {
+      // operator[] above may have inserted a third, zero-valued candidate.
+      if (hit.first && hit.second)
+        junctions[count++] = {taxonomy.LowestCommonAncestor(max_taxon, hit.first),
+                              static_cast<uint32_t>(hit.second)};
+    }
+    if (count == 2 && junctions[0].first < junctions[1].first)
+      std::swap(junctions[0], junctions[1]);
+    if (count == 2 && junctions[0].first == junctions[1].first) {
+      junctions[0].second += junctions[1].second;
+      count = 1;
+    }
+    max_score = 0;
+    for (size_t i = 0; i < count; ++i) {
+      max_score += junctions[i].second;
+      if (max_score >= required_score)
+        return junctions[i].first;
+    }
+    return 0;
+  }
+
+  // Only the called taxon's ancestor chain can be returned by confidence
+  // fallback. Bucket each hit at its first intersection with that chain:
+  // LCA(call, hit). A prefix sum then gives every ancestor's clade support.
+  // This avoids rescanning all hits at each ancestor: O(DH + H) time and
+  // O(H) temporary space, allocated only when confidence needs checking.
+  std::vector<std::pair<taxid_t, uint32_t>> lineage;
+  for (taxid_t ancestor = max_taxon; ancestor;
+       ancestor = taxonomy.nodes()[ancestor].parent_id)
+    lineage.emplace_back(ancestor, 0);
+
+  for (const auto &hit : hit_counts) {
+    if (!hit.first)
+      continue;  // 0 is not a taxon, despite LCA(x, 0) == x.
+    const taxid_t intersection = taxonomy.LowestCommonAncestor(max_taxon, hit.first);
+    // The lineage is strictly decreasing in internal ID.
+    const auto bucket = std::lower_bound(lineage.begin(), lineage.end(), intersection,
+        [](const std::pair<taxid_t, uint32_t> &entry, taxid_t id) {
+          return entry.first > id;
+        });
+    bucket->second += hit.second;
+  }
+
+  max_score = 0;
+  for (const auto &entry : lineage) {
+    max_score += entry.second;
+    if (max_score >= required_score)
+      return entry.first;
+  }
+
+  return 0;
 }
 
 std::string Kraken2ServerClassifier::ReportStats(struct timeval time1, struct timeval time2,
@@ -453,61 +603,34 @@ std::string Kraken2ServerClassifier::ReportTotalStats(ClassificationStats &stats
 }
 
 void Kraken2ServerClassifier::GenerateReport(
-        std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy,
-        timeval &tv1, timeval &tv2, ClassificationStats &stats,
-        ClassificationStats &total_stats, taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters,
-        std::mutex &stats_mtx)
+        std::string &report, timeval &tv1, timeval &tv2,
+        ClassificationStats &stats, taxon_counters_t &taxon_counters)
 {
     std::ostringstream ss;
-    auto total_unclassified = stats.total_sequences - stats.total_classified;
-    ReportKrakenStyle(ss,
-                      opts.report_zero_counts,
-                      opts.report_kmer_data,
-                      taxonomy,
-                      taxon_counters,
-                      stats.total_sequences,
-                      total_unclassified);
-    results.assign(ss.str());
+    ReportKrakenStyle(ss, opts.report_zero_counts, opts.report_kmer_data,
+                      *taxonomy, taxon_counters, stats.total_sequences,
+                      stats.total_sequences - stats.total_classified);
+    report = ss.str();
 
     std::cerr << ReportStats(tv1, tv2, stats) << std::endl;
 
-    if (opts.stats)
+    if (!opts.stats)
+        return;
+
+    std::lock_guard<std::mutex> lock(stats_mtx);
+    total_stats.total_sequences += stats.total_sequences;
+    total_stats.total_classified += stats.total_classified;
+    total_stats.total_bases += stats.total_bases;
+    for (auto &kv_pair : taxon_counters)
     {
-        stats_mtx.lock();
-
-        total_stats.total_sequences += stats.total_sequences;
-        total_stats.total_classified += stats.total_classified;
-        total_stats.total_bases += stats.total_bases;
-        for (auto &kv_pair : taxon_counters)
-        {
-            total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
-        }
-        ss.str(std::string());
-        total_unclassified = total_stats.total_sequences - total_stats.total_classified;
-        ReportKrakenStyle(ss,
-                          opts.report_zero_counts,
-                          opts.report_kmer_data,
-                          taxonomy,
-                          total_taxon_counters,
-                          total_stats.total_sequences,
-                          total_unclassified);
-
-        ss << "\n"
-           << ReportTotalStats(total_stats);
-        summary.assign(ss.str());
-
-        stats_mtx.unlock();
+        total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
     }
-}
-
-std::string Kraken2ServerClassifier::TrimPairInfo(std::string &id)
-{
-    size_t sz = id.size();
-    if (sz <= 2)
-        return id;
-    if (id[sz - 2] == '/' && (id[sz - 1] == '1' || id[sz - 1] == '2'))
-        return id.substr(0, sz - 2);
-    return id;
+    std::ostringstream total;
+    ReportKrakenStyle(total, opts.report_zero_counts, opts.report_kmer_data,
+                      *taxonomy, total_taxon_counters, total_stats.total_sequences,
+                      total_stats.total_sequences - total_stats.total_classified);
+    total << "\n" << ReportTotalStats(total_stats);
+    summary = total.str();
 }
 
 std::string Kraken2ServerClassifier::DoubleStatToString(double d, const int precision)

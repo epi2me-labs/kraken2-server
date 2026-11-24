@@ -1,5 +1,9 @@
 #include <iomanip>
+#include <atomic>
 #include <future>
+#include <mutex>
+#include <memory>
+#include <thread>
 
 // kraken2
 #include "kraken2_data.h"
@@ -7,7 +11,8 @@
 #include "kv_store.h"
 #include "compact_hash.h"
 #include "mmscanner.h"
-#include "seqreader.h"
+#include "fast_reader.h"
+#include "sequence.h"
 #include "aa_translate.h"
 #include "utilities.h"
 
@@ -18,6 +23,7 @@
 #include "Kraken2.grpc.pb.h"
 
 using namespace kraken2;
+using k2server::Sequence;
 
 using grpc::ServerContext;
 using grpc::ServerReaderWriter;
@@ -67,6 +73,29 @@ struct ClassificationStats {
 };
 
 
+/**
+ * @brief Records the first error raised while classifying a stream, so worker
+ *        threads can report it without throwing.
+ */
+class StreamFailure {
+public:
+    void Set(const std::string &message) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!failed_.exchange(true))
+            message_ = message;
+    }
+    bool failed() const { return failed_.load(); }
+    std::string message() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return message_;
+    }
+private:
+    std::atomic<bool> failed_{false};
+    mutable std::mutex mtx_;
+    std::string message_;
+};
+
+
 struct BatchResults {
    Kraken2SequenceResultMulti k2results;
    taxon_counters_t taxon_counters;
@@ -74,88 +103,92 @@ struct BatchResults {
 };
 
 
+enum class IndexState { Loading, Ready, Failed };
+
+
 class Kraken2ServerClassifier {
 
 public:
-    bool index_available = false;
-    bool index_broken = false;
-
     /**
-     * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is
-     *        reused for all requests.
+     * @brief Construct a new Kraken 2 Server Classifier. The database is loaded once,
+     *        in the background, and then reused for all requests: check state()
+     *        before classifying.
      */
-    Kraken2ServerClassifier(Options &options);
+    explicit Kraken2ServerClassifier(const Options &options);
     ~Kraken2ServerClassifier();
 
-    /**
-     * @brief Load kraken2 index
-     * 
-     */
-    void LoadIndex();
+    Kraken2ServerClassifier(const Kraken2ServerClassifier &) = delete;
+    Kraken2ServerClassifier &operator=(const Kraken2ServerClassifier &) = delete;
+
+    IndexState state() const { return state_.load(); }
 
     /**
-     * @brief Classify sequences in a input queue and populate the classification queue.
+     * @brief Classify the sequences arriving on a stream, writing classifications
+     *        back as they are produced. On success `report` holds the Kraken-style
+     *        report for the stream.
+     * @return OK, or INVALID_ARGUMENT if a sequence could not be classified.
      */
-    void ProcessSequenceStream(
-        ServerContext *context, ServerStream *stream, std::string &results);
+    grpc::Status ProcessSequenceStream(
+        ServerContext *context, ServerStream *stream, std::string &report);
     
     /**
-     * @brief Classifies the vector of sequences and populates the string and map with classification
-     *        summary and results respectively.
+     * @brief Classifies a batch of sequences and pushes the results to the queue.
+     *        Failures are recorded in `failure` rather than thrown, as this runs
+     *        on thread pool threads.
      */
-    bool ProcessBatch(
+    void ProcessBatch(
         Kraken2SequenceRequestMulti reqs,
-        ThreadSafeQueue<BatchResults> *result_q);
+        ThreadSafeQueue<BatchResults> *result_q,
+        StreamFailure *failure);
 
     /**
      * @brief Return a summary of historical classifications.
      */
-    const char *GetSummary();
+    std::string GetSummary() const;
 
 private:
     // Database and Historical Stats
     Options opts;
-    Taxonomy taxonomy;
-    CompactHashTable hash;
+    std::atomic<IndexState> state_{IndexState::Loading};
+    std::thread loader_;
+    // Set by the loader thread, before state_ becomes Ready
+    std::unique_ptr<Taxonomy> taxonomy;
+    // 32- or 40-bit cell table, chosen from the database file at load time
+    std::unique_ptr<KeyValueStore> hash;
     IndexOptions idx_opts;
     taxon_counters_t total_taxon_counters;
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
-    std::mutex stats_mtx;
+    mutable std::mutex stats_mtx;  // guards summary, total_stats, total_taxon_counters
     BS::thread_pool pool;
 
-    void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy);
+    /// Load the database files. Runs on loader_.
+    void LoadIndex();
+
+    void AddHitlistString(std::string &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy);
 
     Kraken2SequenceResult ClassifySequence(
         Sequence &dna,
-        CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+        KeyValueStore *hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
         Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
         vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
         vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts);
 
     void MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
 
-    void ProcessFile(
-        Sequence &seq,
-        CompactHashTable &hash, Taxonomy &tax,
-        IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-        taxon_counters_t &total_taxon_counters,
-        Kraken2SequenceResult &classification,
-        MinimizerScanner &scanner, vector<taxid_t> &taxa,
-        taxon_counts_t &hit_counts, vector<string> &translated_frames, SequenceFormat &format);
-
     std::string ReportStats(struct timeval time1, struct timeval time2, ClassificationStats &stats);
 
     std::string ReportTotalStats(ClassificationStats &stats);
 
+    /**
+     * @brief Build the report for one stream, and fold the stream's results
+     *        into the server's history (when tracked).
+     */
     void GenerateReport(
-        std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy,
-        timeval &tv1, timeval &tv2, ClassificationStats &stats, ClassificationStats &total_stats,
-        taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters, std::mutex &stats_mtx);
+        std::string &report, timeval &tv1, timeval &tv2,
+        ClassificationStats &stats, taxon_counters_t &taxon_counters);
 
     taxid_t ResolveTree(taxon_counts_t &hit_counts, Taxonomy &taxonomy, size_t total_minimizers, Options &opts);
-
-    std::string TrimPairInfo(std::string &id);
 
     std::string DoubleStatToString(double d, const int precision);
 };

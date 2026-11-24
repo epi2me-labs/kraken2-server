@@ -1,54 +1,79 @@
-#include <mutex>
-#include <queue>
-#include <optional>
+#pragma once
 
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <utility>
+
+/**
+ * @brief A multi-producer, multi-consumer queue with blocking operations.
+ *
+ * pop() blocks until an item is available, and returns std::nullopt only once
+ * the queue has been closed *and* drained. push() blocks while a bounded queue
+ * is full and returns false if the queue has been closed. Closing wakes
+ * everyone, so either side can use it to signal "no more data" or "stop".
+ */
 template <typename T>
 class ThreadSafeQueue
 {
-    std::queue<T> queue_;
-    mutable std::mutex mutex_;
-
-    // Moved out of public interface to prevent races between this
-    // and pop().
-    bool empty() const
-    {
-        return queue_.empty();
-    }
-
 public:
-    ThreadSafeQueue() = default;
-    ThreadSafeQueue(const ThreadSafeQueue<T> &) = delete;
-    ThreadSafeQueue &operator=(const ThreadSafeQueue<T> &) = delete;
+    /// @param capacity maximum number of queued items; 0 means unbounded.
+    explicit ThreadSafeQueue(std::size_t capacity = 0) : capacity_(capacity) {}
 
-    ThreadSafeQueue(ThreadSafeQueue<T> &&other)
+    ThreadSafeQueue(const ThreadSafeQueue &) = delete;
+    ThreadSafeQueue &operator=(const ThreadSafeQueue &) = delete;
+
+    /// @return false if the queue was closed (the item is dropped).
+    bool push(T item)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_ = std::move(other.queue_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_full_.wait(lock, [this] {
+            return closed_ || capacity_ == 0 || queue_.size() < capacity_;
+        });
+        if (closed_)
+            return false;
+        queue_.push(std::move(item));
+        not_empty_.notify_one();
+        return true;
     }
 
-    virtual ~ThreadSafeQueue() {}
+    /// Blocks for an item. std::nullopt means closed and empty.
+    std::optional<T> pop()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_empty_.wait(lock, [this] { return closed_ || !queue_.empty(); });
+        if (queue_.empty())
+            return std::nullopt;
+        T item = std::move(queue_.front());
+        queue_.pop();
+        not_full_.notify_one();
+        return item;
+    }
 
-    unsigned long size() const
+    /// No further pushes are accepted; consumers drain what is left.
+    void close()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+    std::size_t size() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.size();
     }
 
-    std::optional<T> pop()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.empty())
-        {
-            return {};
-        }
-        T tmp = queue_.front();
-        queue_.pop();
-        return tmp;
-    }
-
-    void push(const T &item)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(item);
-    }
+private:
+    const std::size_t capacity_;
+    mutable std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    std::queue<T> queue_;
+    bool closed_ = false;
 };

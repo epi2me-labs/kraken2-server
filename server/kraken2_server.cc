@@ -1,11 +1,22 @@
-#include <getopt.h>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <condition_variable>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <getopt.h>
+#include <mutex>
+#include <pthread.h>
+#include <sysexits.h>
+#include <unistd.h>
 
 #include <grpc/grpc.h>
-#include <grpc++/server.h>
-#include <grpc++/server_builder.h>
-#include <grpc++/server_context.h>
-#include <grpc++/security/server_credentials.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
+#include <grpcpp/security/server_credentials.h>
 
 #include "messages.h"
 #include "classify_server.h"
@@ -14,8 +25,6 @@ using grpc::ResourceQuota;
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
-using grpc::ServerReader;
-using grpc::ServerReaderWriter;
 using grpc::Status;
 using grpc::StatusCode;
 
@@ -25,17 +34,42 @@ using kraken2proto::Kraken2SummaryRequest;
 using kraken2proto::Kraken2SummaryResults;
 using kraken2proto::Kraken2ShutdownRequest;
 using kraken2proto::Kraken2ShutdownResult;
-using kraken2proto::Kraken2SequenceRequest;
 using kraken2proto::Kraken2SequenceStreamResult;
 using kraken2proto::Kraken2Service;
 
+
+/**
+ * @brief A one-way latch used to ask the server to stop. Requesting is
+ *        idempotent and may come from several places (signals, remote
+ *        shutdown request).
+ */
+class ShutdownLatch {
+public:
+    void Request() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            requested_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    void Wait() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return requested_; });
+    }
+
+private:
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool requested_ = false;
+};
 
 
 class ServiceImpl final : public Kraken2Service::Service {
 
 public:
-    ServiceImpl(Options opts, Kraken2ServerClassifier *classifier, std::promise<void> *exit_requested)
-    : options(opts), classifier(classifier), exit_requested(exit_requested)
+    ServiceImpl(const Options &opts, Kraken2ServerClassifier &classifier, ShutdownLatch &shutdown)
+    : options(opts), classifier(classifier), shutdown(shutdown)
     {}
 
     /**
@@ -44,13 +78,14 @@ public:
     Status GetSummary(
            ServerContext *context, const Kraken2SummaryRequest *req,
             Kraken2SummaryResults *results) override {
-        if (!classifier->index_available) {
-            return IndexStatus();
+        Status status = IndexStatus();
+        if (!status.ok()) {
+            return status;
         }
 
         // Only return summary if the server is recording history.
         if (options.stats) {
-            results->set_summary(classifier->GetSummary());
+            results->set_summary(classifier.GetSummary());
         }
         // Else indicate to the user it is not available.
         else {
@@ -59,13 +94,14 @@ public:
         return Status::OK;
     }
 
-    /** 
-     * @brief Endpoint to request ask server if it is ready.
+    /**
+     * @brief Endpoint to ask the server if it is ready. Clients use the status
+     *        to tell "still loading" (UNAVAILABLE) from "broken".
      */
     Status ServerReady(
             ServerContext *context, const Kraken2ReadyRequest *req,
             Kraken2ReadyResult *results) override {
-        results->set_ready(classifier->index_available && !classifier->index_broken);
+        results->set_ready(classifier.state() == IndexState::Ready);
         return IndexStatus();
     }
 
@@ -74,18 +110,10 @@ public:
      */
     Status RemoteShutdown(
             ServerContext *context, const Kraken2ShutdownRequest *req,
-            kraken2proto::Kraken2ShutdownResult *result) override {
+            Kraken2ShutdownResult *result) override {
         std::cerr << "Received shutdown request." << std::endl;
-        try {
-            exit_requested->set_value();
-            result->set_successful(true);
-            std::cerr << "Shutdown request made." << std::endl;
-        }
-        catch (const std::exception &ex) {
-            result->set_successful(false);
-            std::cerr << "Failed to request shutdown"
-                      << ": " << ex.what() << std::endl;
-        }
+        shutdown.Request();
+        result->set_successful(true);
         return Status::OK;
     }
 
@@ -95,18 +123,21 @@ public:
      */
     Status ClassifyStream(
             ServerContext *context, ServerStream *reader_writer) override {
-        if (!classifier->index_available) {
-            return IndexStatus();
+        Status status = IndexStatus();
+        if (!status.ok()) {
+            return status;
         }
 
-        std::string results;
+        std::string report;
+        status = classifier.ProcessSequenceStream(context, reader_writer, report);
+        if (!status.ok()) {
+            return status;
+        }
 
-        classifier->ProcessSequenceStream(context, reader_writer, std::ref(results));
-
-        // If connection is open, send a final message containing the summary.
+        // If connection is open, send a final message containing the report.
         if (!context->IsCancelled()) {
             Kraken2SequenceStreamResult summary;
-            summary.set_summary(results.c_str());
+            summary.set_summary(report);
             reader_writer->Write(summary);
         }
 
@@ -114,30 +145,82 @@ public:
     }
 
 private:
-    Options options;
-    Kraken2ServerClassifier *classifier;
-    std::promise<void> *exit_requested;
+    const Options &options;
+    Kraken2ServerClassifier &classifier;
+    ShutdownLatch &shutdown;
 
-    grpc::Status IndexNotLoaded = grpc::Status(grpc::StatusCode::UNAVAILABLE, "Index not loaded yet, please wait.");
-    grpc::Status IndexError = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "There was an error loading the index, the server will remain unavailable without intervention.");
-    grpc::Status IndexLoaded = grpc::Status(grpc::StatusCode::OK, "Index loaded.");
-
-    grpc::Status IndexStatus(){
-        if(!classifier->index_available) {
-            return classifier->index_broken ? IndexError : IndexNotLoaded;
+    Status IndexStatus() const {
+        switch (classifier.state()) {
+            case IndexState::Ready:
+                return Status::OK;
+            case IndexState::Failed:
+                return Status(StatusCode::FAILED_PRECONDITION,
+                    "There was an error loading the index, the server will remain unavailable without intervention.");
+            case IndexState::Loading:
+            default:
+                return Status(StatusCode::UNAVAILABLE, "Index not loaded yet, please wait.");
         }
-        return IndexLoaded;
-    } 
-
+    }
 };
 
-// This is used in a lambda below and passed to std::signal, for which we
-// need a void(*)(int) 
-std::promise<void> *exit_requested;
 
-void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
+/**
+ * @brief Turns SIGINT/SIGTERM/SIGQUIT into a request to shut down.
+ *
+ * The signals are blocked in the calling thread (and so in every thread created
+ * after it), and a dedicated thread waits for them synchronously. That avoids
+ * doing anything but the most trivial work in an asynchronous signal handler.
+ * Construct this before creating any other threads.
+ */
+class SignalWatcher {
+public:
+    explicit SignalWatcher(ShutdownLatch &shutdown) {
+        sigemptyset(&set_);
+        sigaddset(&set_, SIGINT);
+        sigaddset(&set_, SIGTERM);
+        sigaddset(&set_, SIGQUIT);
+        // A shell starts background jobs with SIGINT ignored, and ignored
+        // signals are never delivered to sigwait.
+        for (int sig : {SIGINT, SIGTERM, SIGQUIT}) {
+            signal(sig, SIG_DFL);
+        }
+        pthread_sigmask(SIG_BLOCK, &set_, nullptr);
+        thread_ = std::thread([this, &shutdown]() {
+            int sig;
+            if (sigwait(&set_, &sig) == 0) {
+                if (!stopping_) {
+                    std::cerr << "Received signal " << sig << "." << std::endl;
+                }
+                shutdown.Request();
+            }
+            done_ = true;
+        });
+    }
+
+    ~SignalWatcher() {
+        // wake the watcher thread if no signal ever arrived
+        stopping_ = true;
+        if (!done_) {
+            pthread_kill(thread_.native_handle(), SIGTERM);
+        }
+        thread_.join();
+    }
+
+private:
+    sigset_t set_;
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> done_{false};
+    std::thread thread_;
+};
+
+
+/**
+ * @brief Serve requests until a shutdown is requested.
+ * @return EX_OK on a clean shutdown, EX_UNAVAILABLE if the server could not be started.
+ */
+int RunServer(const Options &opts, Kraken2ServerClassifier &classifier, ShutdownLatch &shutdown) {
     std::string server_address = opts.host + ":" + std::to_string(opts.port);
-    ServiceImpl service(opts, classifier, exit_requested);
+    ServiceImpl service(opts, classifier, shutdown);
     // Sets the max number of concurrent requests
     ResourceQuota rq;
     if (opts.max_queue > 0){
@@ -158,185 +241,180 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     builder.SetMaxSendMessageSize(128 * 1024 * 1024);
     builder.SetMaxMessageSize(128 * 1024 * 1024);
     builder.SetMaxReceiveMessageSize(128 * 1024 * 1024);
-    // Shared pointer so graceful shutdown can be invoked.
-    std::shared_ptr<Server> server(builder.BuildAndStart());
+    std::unique_ptr<Server> server(builder.BuildAndStart());
     if (server == nullptr) {
-        std::cout << "Failed to start server on " << server_address
-                  << ". See above for more details." << std::endl;     
-    } else {
-        std::cout << "Server listening on " << server_address
-                  << ". Press Ctrl-C to end." << std::endl;
-        // handle interrupts
-        auto handler = [](int s) { exit_requested->set_value(); };
-        // TODO: what's the actual behaviour here, i.e. what does Shutdown() do?
-        std::signal(SIGINT, handler);
-        std::signal(SIGTERM, handler);
-        std::signal(SIGQUIT, handler);
-
-        // block until exit request is set
-        auto f = exit_requested->get_future();
-        f.wait();
-        server->Shutdown();
+        std::cerr << "Failed to start server on " << server_address
+                  << ". See above for more details." << std::endl;
+        return EX_UNAVAILABLE;
     }
+    std::cout << "Server listening on " << server_address
+              << ". Press Ctrl-C to end." << std::endl;
+
+    shutdown.Wait();
+    std::cerr << "Shutting down." << std::endl;
+    // Lets in-flight calls finish, but gives up on them after a while so a
+    // stalled client cannot keep the server alive indefinitely.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    return EX_OK;
 }
 
 
-void Usage(int exit_code) {
-    std::cerr << "Usage: kraken2-server [options]" << std::endl
-              << std::endl
-              << "Options: (* mandatory)" << std::endl
-              << "\t-h, -H, -?, --help              Usage" << std::endl
-              << "*\t-d, -D, --db [path]            Path to Kraken 2 database" << std::endl
-              << "\t-r, -R, --max-requests [int]    Max number of requests from clients to process concurrently (0 for default)" << std::endl
-              << "\t-x, -X, --thread-pool [int]     Number of threads to use to classify reads from each client." << std::endl
-              << "\t-s, -S, --no-stats              Do not track statistics of all processed sequences on this server. Saves memory long-term." << std::endl
-              << "\t-i, -I  --host-ip               Server IP address (default: localhost)." << std::endl
-              << "\t-p, -P, --port [int]            Port number on which to listen for requests (0 - 65535, default 8080.)" << std::endl
-              << "\t-k, -K, --report-kmer           Include distinct k-mers in reports" << std::endl
-              << "\t-z, -Z, --report-zero           Include zero count taxons in reports" << std::endl
-              << "\t-t, -T, --translated-search     Use translated search when running classifications" << std::endl
-              << "\t-c, -C, --confidence [double]   Confidence score threshold (default: 0.0) (0 - 1)" << std::endl
-              << "\t-q, -Q, --min-quality [int]     Minimum base quality used in classification (default: 0), only effective with FASTQ input)." << std::endl
-              << "\t-g, -G, --hit-groups [int]      Minimum number of hit groups (overlapping k-mers sharing the same minimizer) needed to make a call (default: 2)" << std::endl
-              << "\t-o, -O, --memory-mapping        Avoids loading database into RAM" << std::endl;
-    exit(exit_code);
+void Usage(std::ostream &out) {
+    out << "Usage: kraken2_server [options]" << std::endl
+        << std::endl
+        << "Options: (* mandatory)" << std::endl
+        << "\t-h, -H, --help                  Usage" << std::endl
+        << "*\t-d, -D, --db [path]            Path to Kraken 2 database" << std::endl
+        << "\t-r, -R, --max-requests [int]    Max number of requests from clients to process concurrently (0 for default)" << std::endl
+        << "\t-x, -X, --thread-pool [int]     Number of threads used to classify reads, shared by all clients (default: 1, 0 for all hardware threads)" << std::endl
+        << "\t-s, -S, --no-stats              Do not track statistics of all processed sequences on this server. Saves memory long-term." << std::endl
+        << "\t-i, -I  --host-ip               Server IP address (default: localhost)." << std::endl
+        << "\t-p, -P, --port [int]            Port number on which to listen for requests (0 - 65535, default 8080.)" << std::endl
+        << "\t-k, -K, --report-kmer           Include distinct k-mers in reports" << std::endl
+        << "\t-z, -Z, --report-zero           Include zero count taxons in reports" << std::endl
+        << "\t-t, -T, --translated-search     Has no effect: translated search is used if the database was built for it" << std::endl
+        << "\t-c, -C, --confidence [double]   Confidence score threshold (default: 0.0) (0 - 1)" << std::endl
+        << "\t-q, -Q, --min-quality [int]     Minimum base quality used in classification (default: 0), only effective with FASTQ input)." << std::endl
+        << "\t-g, -G, --hit-groups [int]      Minimum number of hit groups (overlapping k-mers sharing the same minimizer) needed to make a call (default: 2)" << std::endl
+        << "\t-o, -O, --memory-mapping        Avoids loading database into RAM" << std::endl
+        << "\t-w, -W, --wait [int]            Seconds to wait before loading the database (for testing clients)" << std::endl;
+}
+
+
+[[noreturn]] void UsageError(const std::string &message) {
+    std::cerr << "kraken2_server: " << message << std::endl << std::endl;
+    Usage(std::cerr);
+    exit(EX_USAGE);
+}
+
+
+// Parse an integer option value, insisting it is a whole number in [min, max].
+int ParseInt(const char *value, const char *name, long min, long max) {
+    char *end = nullptr;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno != 0 || parsed < min || parsed > max) {
+        UsageError(std::string("invalid value for ") + name + ": '" + value + "' (expected " +
+                   std::to_string(min) + " - " + std::to_string(max) + ")");
+    }
+    return static_cast<int>(parsed);
+}
+
+
+double ParseDouble(const char *value, const char *name, double min, double max) {
+    char *end = nullptr;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (end == value || *end != '\0' || errno != 0 || !(parsed >= min && parsed <= max)) {
+        UsageError(std::string("invalid value for ") + name + ": '" + value + "' (expected " +
+                   std::to_string(min) + " - " + std::to_string(max) + ")");
+    }
+    return parsed;
 }
 
 
 void ParseCommandLine(int argc, char **argv, Options &opts) {
-    // Define the long shell arguments
+    // Long options map onto the short options. Upper case short options are
+    // also accepted and mean the same as lower case.
     struct option long_options[] = {
         {"db", required_argument, NULL, 'd'},
-        {"db", required_argument, NULL, 'D'},
         {"max-requests", required_argument, NULL, 'r'},
-        {"max-requests", required_argument, NULL, 'R'},
         {"thread-pool", required_argument, NULL, 'x'},
-        {"thread-pool", required_argument, NULL, 'X'},
         {"no-stats", no_argument, NULL, 's'},
-        {"no-stats", no_argument, NULL, 'S'},
         {"host-ip", required_argument, NULL, 'i'},
-        {"host-ip", required_argument, NULL, 'I'},
         {"port", required_argument, NULL, 'p'},
-        {"port", required_argument, NULL, 'P'},
         {"report-kmer", no_argument, NULL, 'k'},
-        {"report-kmer", no_argument, NULL, 'K'},
         {"report-zero", no_argument, NULL, 'z'},
-        {"report-zero", no_argument, NULL, 'Z'},
         {"translated-search", no_argument, NULL, 't'},
-        {"translated-search", no_argument, NULL, 'T'},
         {"confidence", required_argument, NULL, 'c'},
-        {"confidence", required_argument, NULL, 'C'},
         {"min-quality", required_argument, NULL, 'q'},
-        {"min-quality", required_argument, NULL, 'Q'},
         {"hit-groups", required_argument, NULL, 'g'},
-        {"hit-groups", required_argument, NULL, 'G'},
         {"memory-mapping", no_argument, NULL, 'o'},
-        {"memory-mapping", no_argument, NULL, 'O'},
         {"wait", required_argument, NULL, 'w'},
-        {"wait", required_argument, NULL, 'W'},
         {"help", no_argument, NULL, 'h'},
-        {"help", no_argument, NULL, 'H'},
         {NULL, 0, NULL, 0}
     };
+    const char *short_options = "hHd:D:r:R:x:X:sSi:I:p:P:kKzZtTc:C:q:Q:g:G:oOw:W:";
+
     int opt;
-    // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(
-        argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOx:X:p:P:wW", long_options, NULL)) != -1) {
-        switch (opt){
-            case '?':
+    while ((opt = getopt_long(argc, argv, short_options, long_options, NULL)) != -1) {
+        switch (tolower(opt)) {
             case 'h':
-            case 'H':
-                Usage(0);
-                break;
+                Usage(std::cout);
+                exit(EX_OK);
             case 'd':
-            case 'D':
                 opts.db_path = optarg;
-                opts.taxonomy_filename = optarg + std::string("/taxo.k2d");
-                opts.options_filename = optarg + std::string("/opts.k2d");
-                opts.index_filename = optarg + std::string("/hash.k2d");
+                opts.taxonomy_filename = opts.db_path + "/taxo.k2d";
+                opts.options_filename = opts.db_path + "/opts.k2d";
+                opts.index_filename = opts.db_path + "/hash.k2d";
                 break;
             case 'r':
-            case 'R':
-                opts.max_queue = atoi(optarg);
-                if (opts.max_queue < 0) {
-                    std::cerr << "Number of maximum concurrent requests cannot be less than 1 (0 for default)."
-                              << std::endl;
-                    exit(0);
-                }
+                opts.max_queue = ParseInt(optarg, "--max-requests", 0, INT_MAX);
                 break;
             case 'x':
-            case 'X':
-                opts.thread_pool = atoi(optarg);
-                if (opts.thread_pool < 0) {
-                    std::cerr << "Number of maximum threads per client cannot be less than 1."
-                              << std::endl;
-                    exit(0);
-                }
+                opts.thread_pool = ParseInt(optarg, "--thread-pool", 0, 4096);
                 break;
             case 's':
-            case 'S':
                 opts.stats = false;
                 break;
             case 'i':
-            case 'I':
                 opts.host = optarg;
                 break;
             case 'p':
-            case 'P':
-                opts.port = atoi(optarg);
-                if (opts.port < 0 || opts.port > 65535) {
-                    std::cerr << "Port number not valid (0 - 65535)" << std::endl;
-                    exit(0);
-                }
+                opts.port = ParseInt(optarg, "--port", 0, 65535);
                 break;
             case 'k':
-            case 'K':
                 opts.report_kmer_data = true;
                 break;
             case 'z':
-            case 'Z':
                 opts.report_zero_counts = true;
                 break;
             case 't':
-            case 'T':
                 opts.use_translated_search = true;
                 break;
             case 'c':
-            case 'C':
-                opts.confidence_threshold = atof(optarg);
-                if (opts.confidence_threshold < 0 || opts.confidence_threshold > 1) {
-                    std::cerr << "Confidence threshold is not valid (0 - 1)" << std::endl;
-                    exit(0);
-                }
+                opts.confidence_threshold = ParseDouble(optarg, "--confidence", 0.0, 1.0);
                 break;
             case 'q':
-            case 'Q':
-                opts.minimum_quality_score = atoi(optarg);
-                if (opts.minimum_quality_score < 0) {
-                    std::cerr << "Minimum quality score is not valid (> 0)" << std::endl;
-                    exit(0);
-                }
+                opts.minimum_quality_score = ParseInt(optarg, "--min-quality", 0, 100);
                 break;
             case 'g':
-            case 'G':
-                opts.minimum_hit_groups = atoi(optarg);
-                if (opts.minimum_hit_groups < 0) {
-                    std::cerr << "Minimum hit groups is not valid (> 0)" << std::endl;
-                    exit(0);
-                }
+                opts.minimum_hit_groups = ParseInt(optarg, "--hit-groups", 0, INT_MAX);
                 break;
             case 'o':
-            case 'O':
                 opts.use_memory_mapping = true;
                 break;
             case 'w':
-            case 'W':
-                opts.wait = atoi(optarg);
+                opts.wait = ParseInt(optarg, "--wait", 0, INT_MAX);
+                break;
+            case '?':
+                if (optopt == '?') {  // asked for with -?
+                    Usage(std::cout);
+                    exit(EX_OK);
+                }
+                // getopt has already described the problem
+                std::cerr << std::endl;
+                Usage(std::cerr);
+                exit(EX_USAGE);
+            default:
+                // getopt has already described the problem
+                std::cerr << std::endl;
+                Usage(std::cerr);
+                exit(EX_USAGE);
         }
     }
+    if (optind < argc) {
+        UsageError(std::string("unexpected argument: ") + argv[optind]);
+    }
     if (opts.db_path.empty()) {
-        std::cerr << "You must specify the path to the Kraken 2 database." << std::endl;
-        Usage(0);
+        UsageError("you must specify the path to the Kraken 2 database.");
+    }
+    // Fail now, rather than serving an unusable server, if the database is not there.
+    for (const std::string &file : {opts.taxonomy_filename, opts.options_filename, opts.index_filename}) {
+        if (access(file.c_str(), R_OK) != 0) {
+            std::cerr << "kraken2_server: cannot read " << file << ": " << strerror(errno) << std::endl;
+            exit(EX_NOINPUT);
+        }
     }
 }
 
@@ -344,12 +422,15 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
 int main(int argc, char **argv) {
     Options opts;
     ParseCommandLine(argc, argv, opts);
-    Kraken2ServerClassifier *classifier = new Kraken2ServerClassifier(opts);
-    exit_requested = new std::promise<void>;
-    RunServer(opts, classifier);
 
-    int rtn = classifier->index_available ? EX_OK : EX_IOERR;
-    delete classifier;
-    delete exit_requested;
+    ShutdownLatch shutdown;
+    // Must come before any threads are started
+    SignalWatcher signals(shutdown);
+
+    Kraken2ServerClassifier classifier(opts);
+    int rtn = RunServer(opts, classifier, shutdown);
+    if (rtn == EX_OK && classifier.state() == IndexState::Failed) {
+        rtn = EX_IOERR;
+    }
     return rtn;
 }

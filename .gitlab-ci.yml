@@ -1,133 +1,122 @@
 include:
     - project: "epi2melabs/ci-templates"
-      file: "push-github.yaml"
-    - project: "epi2melabs/ci-templates"
-      file: "push-conda.yaml"
-    - project: "epi2melabs/ci-templates"
-      file: "snippets.yaml"
+      file:
+          - "push-github.yaml"
+          - "push-conda.yaml"
+          - "snippets.yaml"
+          - ".eks-tags.yaml"
 
-image: ${UBUNTUIMAGE}:20.04
+image: ${UBUNTUIMAGE}:22.04
+
+# Use branch pipelines rather than merge request pipelines: without this gate
+# GitLab creates both for the same commit when included templates make MR jobs
+# eligible.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: always
+
+default:
+  tags: !reference [.eks-small-standard-tags, tags]
 
 variables:
     GIT_SUBMODULE_STRATEGY: recursive
 
-
 stages:
     - prerelease
-    - build-deps
+    - test
+    - package
     - release
+
+# Test (UPLOAD: "no") conda packages are built automatically on dev, and can be
+# started by hand from the pipeline on any other branch.
+.package-rules: &package-rules
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG == null'
+      when: manual
+      allow_failure: true
 
 
 deploy-checks:
     stage: prerelease
-    variables:
-        PACKAGE_NAME: modbampy
     script:
-        # TODO: store a version in code somewhere and check
         - !reference [.check, changelog]
         - !reference [.check, license]
     rules:
         - if: '$CI_COMMIT_TAG =~ /^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$/'
 
 
-# making gRPC can take an age. I (cjw) couldn't get cmake to work nicely
-# with gRPC library package from conda. So instead we'll build once in conda
-# and cache the result for future builds. Note if conda compiler ever changes
-# this build may need to be refreshed.
-.make-grpc:
-    stage: build-deps
+# Build with gRPC and protobuf from conda-forge packages and run all the checks
+# against upstream kraken2's `classify`, on small synthetic databases that the
+# checks generate themselves. Runs on every push.
+test:
+    stage: test
+    variables:
+        MINICONDA_VERSION: "24.9.2-0"
     script:
-        - ls
-        - if [ -d proto-build ]; then echo "SKIPPING gRPC build"; exit 0; fi
-        - echo "SETTING UP CONDA"
-        - condasetup="Mambaforge-${MINICONDAOS}-${ARCH}.sh"
-        - wget https://github.com/conda-forge/miniforge/releases/latest/download/${condasetup}
-        - ourconda=/tmp/miniconda-grpcbuild
-        - bash ${condasetup} -b -p ${ourconda}
-        - rm ${condasetup}
-        - source ${ourconda}/bin/activate
-        - conda init
-        - mamba install -y git cxx-compiler make cmake
-        - echo "BUILDING gRPC UNDER CONDA for ${MINICONDAOS}-${ARCH}"
-        - export LDFLAGS="-lrt"
-        - export PROTO_DIR=$PWD/proto-build
-        - mkdir -p $PROTO_DIR
-        - git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
-        - mkdir -p grpc/cmake/build
-        - pushd grpc/cmake/build
-        - cmake -DgRPC_INSTALL=ON -DgRPC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$PROTO_DIR ../..
-        - make -j 8
-        - make install
-        - popd
-    cache:
-        key: "$MINICONDAOS-$ARCH"
-        paths:
-            - proto-build
-    artifacts:
-        paths:
-            - proto-build 
+        - MINICONDA_LOCATION=$(mktemp -d)/miniconda
+        - !reference [.install, mamba]
+        - mamba create -y -n k2 -c conda-forge --override-channels libgrpc libprotobuf zlib cmake cxx-compiler make python
+        - mamba activate k2
+        # kraken2-server
+        - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${CONDA_PREFIX}
+        - cmake --build build -j $(nproc)
+        # upstream kraken2, for the reference `classify` and for `build_db`
+        - cmake -S kraken2 -B build-kraken2 -DCMAKE_BUILD_TYPE=Release
+        - cmake --build build-kraken2 -j $(nproc) --target classify build_db
+        - testing/run_all_checks.sh build build-kraken2/src/classify build-kraken2/src/build_db
 
 
-make-grpc-x86:
-    extends: .make-grpc
-    variables:
-        MINICONDAOS: Linux
-        ARCH: x86_64
-    tags: # just for cache
-        - grid
-        - docker
-
-make-grpc-arm64:
-    extends: .make-grpc
-    variables:
-        MINICONDAOS: Linux
-        ARCH: aarch64
-    tags: # TODO: use a single runner to hit the cache
-        - arm64
-
-.conda:
-    variables:
-        RECIPEPATH: "../conda"
-    before_script:
-        - export CONDA_PKG=${CI_PROJECT_NAME}
-        - VERSION="0.0.0"
-        - if [[ -n "${CI_COMMIT_TAG}" ]]; then VERSION=${CI_COMMIT_TAG/v}; fi
-        - export CONDA_PKG_VERSION="${VERSION}"
-        - mkdir conda-build
-        - cd conda-build
-    rules:
-        - if: '$CI_COMMIT_TAG =~ /^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$/'
-        - if: '$CI_COMMIT_BRANCH =~ /package-build/'
+.before-script: &before-script |
+    export CONDA_PKG=${CI_PROJECT_NAME}
+    VERSION="0.0.0"
+    if [[ -n "${CI_COMMIT_TAG}" ]]; then VERSION=${CI_COMMIT_TAG/v}; fi
+    export CONDA_PKG_VERSION="${VERSION}"
+    cd conda
 
 
+# Release packages: built and uploaded when a version tag is pushed.
 conda-linux-x86:
-    extends:
-        - .deploy-conda-linux
-        - .conda
-    variables:
-        MINICONDAOS: Linux
-        ARCH: x86_64
-    needs:
-        - make-grpc-x86
+    extends: .deploy-conda
+    before_script:
+        - *before-script
 
 conda-linux-arm64:
-    extends:
-        - .deploy-conda-linux-arm
-        - .conda
-    variables:
-        MINICONDAOS: Linux
-        ARCH: aarch64
-    tags:
-        - arm64
-    needs:
-        - make-grpc-arm64
+    extends: .deploy-conda-linux-arm
+    before_script:
+        - *before-script
 
-#conda-mac:
-#    extends:
-#        - .deploy-conda-mac
-#        - .conda
-#
-#conda-mac-arm:
-#    extends:
-#        - .deploy-conda-mac-arm
-#        - .conda
+conda-mac-arm:
+    extends: .deploy-conda-mac-arm
+    before_script:
+        - *before-script
+
+
+# Test packages: the same builds, but with UPLOAD "no" so nothing is pushed.
+test-conda-linux-x86:
+    stage: package
+    extends: .deploy-conda
+    variables:
+        UPLOAD: "no"
+    before_script:
+        - *before-script
+    rules: *package-rules
+
+test-conda-linux-arm64:
+    stage: package
+    extends: .deploy-conda-linux-arm
+    variables:
+        UPLOAD: "no"
+    before_script:
+        - *before-script
+    rules: *package-rules
+
+test-conda-mac-arm:
+    stage: package
+    extends: .deploy-conda-mac-arm
+    variables:
+        UPLOAD: "no"
+    before_script:
+        - *before-script
+    rules: *package-rules
