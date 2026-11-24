@@ -11,14 +11,19 @@ build:
 requirements:
     build:
         - {{ compiler('cxx') }}
-        - git
         - make
         - cmake
+    host:
+        - libgrpc
+        - libprotobuf
+        - zlib
+        - llvm-openmp  # [osx]
+    # libgrpc, libprotobuf etc. add the matching run requirements themselves
 
 test:
     commands:
-        kraken2_server --help
-        kraken2_client --help
+        - kraken2_server --help
+        - kraken2_client --help
 
 about:
     home: "https://github.com/epi2me-labs/fastcat"
@@ -32,4 +37,3 @@ about:
 extra:
     recipe-maintainers:
         - cjw85
-

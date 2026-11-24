@@ -1,4 +1,6 @@
+#pragma once
 #include <string>
+#include <vector>
 
 #include "Kraken2.grpc.pb.h"
 
@@ -14,6 +16,8 @@ class FastReader
 public:
     FastReader(std::string filename);
     ~FastReader();
+    FastReader(const FastReader &) = delete;
+    FastReader &operator=(const FastReader &) = delete;
     // Read (at most) one sequence
     int read(Kraken2SequenceRequest&);
     // read (up to) batch_size sequences

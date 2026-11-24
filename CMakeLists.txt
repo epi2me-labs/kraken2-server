@@ -62,6 +62,9 @@ else()
     message("ERROR: OpenMP could not be found.")
 endif()
 
+find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
+
 # Sources for file reading and messaging
 add_library(classify
     kraken2/src/compact_hash.cc
@@ -69,16 +72,20 @@ add_library(classify
     kraken2/src/mmap_file.cc
     kraken2/src/omp_hack.cc
     kraken2/src/mmscanner.cc
-    kraken2/src/seqreader.cc
+    kraken2/src/fast_reader.cc
     kraken2/src/aa_translate.cc
     kraken2/src/utilities.cc
-    kraken2/src/hyperloglogplus.cc)
+    kraken2/src/hyperloglogplus.cc
+    kraken2/src/reports.cc)
 
 # Specify the headers (include) for this lib (target) and declare them PUBLIC so are findable by other libs/executables
 target_include_directories(classify PUBLIC kraken2/src/)
+target_link_libraries(classify PUBLIC ZLIB::ZLIB Threads::Threads)
 
 # Execute the CMakeLists.txt in these folders
 add_subdirectory(protos)
 add_subdirectory(utils)
 add_subdirectory(server)
 add_subdirectory(client)
+add_subdirectory(tests)
+

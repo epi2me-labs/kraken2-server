@@ -46,20 +46,35 @@ in future provide compatible output.
 
 ## Building from source
 
-The project can be built with `cmake` >3.13 and a C++17 compiler.
+The project can be built with `cmake` >3.13 and a C++17 compiler. The
+`kraken2` directory is a git submodule, so clone with `--recurse-submodules`.
 
-The server-client architecture uses gRPC and protobuf to communicate. An
-installation of gRPC (with protobuf is required).
+The server-client architecture uses gRPC and protobuf to communicate. The
+easiest way to get them, and a compiler, is from conda-forge:
 
-The following should be sufficient to setup an installation of gRPC
-and protobuf (see [gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp/quickstart/)):
+```
+mamba create -n kraken2-server-build -c conda-forge \
+    libgrpc libprotobuf zlib cmake cxx-compiler make llvm-openmp
+mamba activate kraken2-server-build
+
+git clone --recurse-submodules https://github.com/epi2me-labs/kraken2-server.git
+cd kraken2-server
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${CONDA_PREFIX}
+cmake --build build -j 8
+```
+
+(`llvm-openmp` is needed on macOS; on Linux the compiler provides OpenMP.)
+This has been built with libgrpc 1.85 and libprotobuf 35.1 on macOS arm64.
+
+Alternatively, build gRPC yourself (see
+[gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp/quickstart/))
+and point `CMAKE_PREFIX_PATH` at the install:
 
 ```
 INSTALL_ROOT=$PWD  # or something else
 
 # this flag might be needed on some platforms
 export LDFLAGS="-lrt"
-
 
 export PROTO_DIR=$INSTALL_ROOT/proto-build
 export PATH="$PROTO_DIR/bin:$PATH"
@@ -75,19 +90,9 @@ cmake -DgRPC_INSTALL=ON \
 make -j
 make install
 popd
-```
 
-To build the project itself then run:
-
-```
-git clone https://github.com/epi2me-labs/kraken2-server.git`
-cd kraken2-server
-mkdir build
-pushd build
-# PROTO_DIR as above
-cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} --config Release ..
-make -j 8
-popd
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${PROTO_DIR}
+cmake --build build -j 8
 ```
 
 The server and client executables will be written to:
@@ -96,6 +101,32 @@ The server and client executables will be written to:
 build/server/kraken2_server
 build/client/kraken2_client
 ```
+
+## Testing
+
+`testing/run_all_checks.sh` runs every check. It needs the `classify` and
+`build_db` programs from the `kraken2` submodule (built with its own
+`CMakeLists.txt`):
+
+```
+cmake -S kraken2 -B build-kraken2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-kraken2 -j 8 --target classify build_db
+
+testing/run_all_checks.sh build build-kraken2/src/classify build-kraken2/src/build_db
+```
+
+It generates small synthetic databases (DNA with 32 and 40 bit hash cells, and
+protein for translated search) and then:
+
+* checks that the server returns the same per-read calls and report as
+  upstream `classify`, with the same options on both sides
+  (`testing/compare_with_kraken2.sh`, which can also be run by itself
+  on any database and reads);
+* runs several clients at once and checks that each gets exactly the answers for
+  its own reads, and that the server's running totals are right
+  (`testing/multi_client_check.sh`);
+* checks that a malformed read fails only its own stream with a clear error and
+  does not harm the server or other streams (`tests/run_error_test.sh`).
 
 ## Benchmarks
 

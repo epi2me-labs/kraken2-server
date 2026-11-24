@@ -41,3 +41,13 @@ target_link_libraries(kraken2_proto
     ${_PROTOBUF_LIBPROTOBUF}
     ${_REFLECTION}
     ${_GRPC_GRPCPP})
+
+# Anything that includes gRPC's headers (and so abseil's) must be compiled with
+# NDEBUG, as abseil is. On Linux abseil's Mutex destructor is inline, and
+# without NDEBUG it calls Mutex::Dtor(), which release builds of abseil's shared
+# library do not export, so linking fails with undefined references. (macOS is
+# unaffected, which is why this only showed up in Linux CI.) Linking this target
+# passes the definition on to the server, client, tests and utils. The kraken2
+# classification code is deliberately left alone, so its asserts stay enabled as
+# upstream builds them.
+target_compile_definitions(kraken2_proto PUBLIC NDEBUG)
