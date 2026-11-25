@@ -8,12 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Tests: synthetic DNA (32 and 40 bit cell) and protein databases, comparison with
   upstream `classify`, a multi-client check, and a gRPC error-path test
-  (`testing/run_all_checks.sh`).
+  (`tests/integration/run_all_checks.sh`).
 ### Changed
 - gRPC and protobuf are taken from conda-forge packages in the conda recipe and
   CI, rather than built from source. Builds with libgrpc 1.85.
 - Updated to kraken2 commit 8d0e7ad (v2.18.0-RC2). Per-read classifications and
-  reports match the upstream `classify` program (see `testing/compare_with_kraken2.sh`).
+  reports match the upstream `classify` program (see `tests/integration/compare_with_kraken2.sh`).
   Databases with 40-bit hash cells are now supported.
 - The database loads in the background, so the server accepts connections
   immediately and tells clients to wait until it is ready.
@@ -24,6 +24,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be loaded.
 - The client no longer sends each read a second time as text (`str_representation`).
 - The client polls a loading server every 2s rather than 10s.
+- The documented from-source gRPC is now v1.85.4, the version conda provides and CI tests
+  (it was 1.46.3), built in Release mode. The CMake finds Abseil and utf8_range before
+  protobuf, which protobuf 22 and later needs when gRPC is built from source.
+- A plain `cmake` now builds in Release mode. Without a build type the compiler was given no
+  optimisation flags at all, and the server ran about 7 times slower (6.2s against
+  0.9s for 36,850 reads in a quick test).
+- Everything that is built goes under `build/`: our programs in `build/kraken2-server/`
+  (the server is `build/kraken2-server/server/kraken2_server`), upstream kraken2 in
+  `build/kraken2/`, and a gRPC built from source is installed in `build/proto/`.
+- Our code is under `src/`, tests under `tests/` (the `testing/` scripts moved to
+  `tests/integration/`), and third party code, including the kraken2 submodule
+  (now `third_party/kraken2`), under `third_party/`.
+- The code is reorganised into a core library (`core/`, with no gRPC in it) and a
+  thin server and client on top of it. The wire protocol is unchanged, so existing
+  clients and servers still work with each other.
+- Work for the server's threads goes through a bounded queue, so a client that sends
+  reads faster than they can be classified is held back (through gRPC's flow control)
+  rather than the server queueing them without limit. This replaces the vendored
+  `BS::thread_pool`.
+- Reads are classified from views of the request, rather than being copied into
+  a separate record first.
+- The summary is worked out when it is asked for, rather than rebuilt every time a
+  client's stream finishes.
+- Command lines are parsed with CLI11, so `--help` is generated from the options.
+  Exit statuses are unchanged (64 for a bad command line, 66 for an unreadable
+  database).
 ### Fixed
 - Classification no longer spins a CPU waiting for results; throughput is much higher.
 - A read with mismatched sequence and quality lengths failed the stream with
@@ -35,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Client crash when closing its input file, and when the input file did not exist.
   The client now exits with an error if its input cannot be read or is malformed.
 ### Removed
+- `client/kseq.cc` and `kseq.cc.h` (the reader is now `SequenceReader`) and the
+  `utils` library.
 - Unused utility code and the unused `thread_pool_light.hpp`.
 
 ## [v0.1.8]

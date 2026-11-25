@@ -1,5 +1,3 @@
-[submodule "grpc"]
-	shallow = true
 [submodule "kraken2"]
-	path = kraken2
+	path = third_party/kraken2
 	url = https://github.com/DerrickWood/kraken2.git
