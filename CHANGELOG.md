@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.2.0]
 ### Added
 - Tests: synthetic DNA (32 and 40 bit cell) and protein databases, comparison with
   upstream `classify`, a multi-client check, and a gRPC error-path test
@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Our code is under `src/`, tests under `tests/` (the `testing/` scripts moved to
   `tests/integration/`), and third party code, including the kraken2 submodule
   (now `third_party/kraken2`), under `third_party/`.
-- The code is reorganised into a core library (`core/`, with no gRPC in it) and a
+- The code is reorganised into a core library (`src/core/`, with no gRPC in it) and a
   thin server and client on top of it. The wire protocol is unchanged, so existing
   clients and servers still work with each other.
 - Work for the server's threads goes through a bounded queue, so a client that sends
