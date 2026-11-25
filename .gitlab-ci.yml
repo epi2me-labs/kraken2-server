@@ -39,6 +39,8 @@ stages:
 
 deploy-checks:
     stage: prerelease
+    variables:
+        GLEEOK_PYTHON_VERSION: "3.12"
     script:
         - !reference [.check, changelog]
         - !reference [.check, license]
