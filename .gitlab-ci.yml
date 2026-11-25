@@ -34,7 +34,6 @@ stages:
 .package-rules: &package-rules
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "dev"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG == null'
-      when: manual
       allow_failure: true
 
 
@@ -60,12 +59,12 @@ test:
         - mamba create -y -n k2 -c conda-forge --override-channels libgrpc libprotobuf zlib cmake cxx-compiler make python
         - mamba activate k2
         # kraken2-server
-        - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${CONDA_PREFIX}
-        - cmake --build build -j $(nproc)
+        - cmake -S . -B build/kraken2-server -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${CONDA_PREFIX}
+        - cmake --build build/kraken2-server -j $(nproc)
         # upstream kraken2, for the reference `classify` and for `build_db`
-        - cmake -S kraken2 -B build-kraken2 -DCMAKE_BUILD_TYPE=Release
-        - cmake --build build-kraken2 -j $(nproc) --target classify build_db
-        - testing/run_all_checks.sh build build-kraken2/src/classify build-kraken2/src/build_db
+        - cmake -S third_party/kraken2 -B build/kraken2 -DCMAKE_BUILD_TYPE=Release
+        - cmake --build build/kraken2 -j $(nproc) --target classify build_db
+        - tests/integration/run_all_checks.sh build/kraken2-server build/kraken2/src/classify build/kraken2/src/build_db
 
 
 .before-script: &before-script |

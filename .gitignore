@@ -1,12 +1,26 @@
-3rdparty/
+# builds
 build/
-grpc/
-proto-build/
 
-testing/virus-zymo-kraken*
-testing/*.fastq*
+# gRPC, if cloned to build against (see the README); what it builds goes in build/
+/third_party/grpc/
 
+# things moved aside while tidying, kept out of git
+/_junk/
+
+# test data (see tests/data/README.md): big, so not in git
+tests/data/*
+!tests/data/README.md
+
+# editors and OS
 .vscode/
 *.DS_Store
 *.swp
 *.swo
+
+# leftovers from running things here
+.nextflow*
+/work/
+/output/
+nohup.out
+wget-log
+.codechecker/

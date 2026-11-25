@@ -1,12 +1,19 @@
 ###
-# There are hinst below to look for gRPC and Protobuf libraries in the
-# proto-build directory as per the instruction in the README.md file.
+# There are hints below to look for gRPC and Protobuf libraries in the
+# build/proto directory as per the instruction in the README.md file.
 
 # The minimum permitted CMake version
 cmake_minimum_required(VERSION 3.13)
 
 # Project name
 project(kraken2_server_client)
+
+# Optimised unless asked otherwise. Without a build type the compiler gets no
+# optimisation flags at all, and the server runs several times slower, which is
+# an easy mistake to make by leaving the option off.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Type of build (Release unless set)" FORCE)
+endif()
 
 # Set the C++ standard to be used
 set(CMAKE_CXX_STANDARD 17)
@@ -16,10 +23,17 @@ add_definitions(-DLINEAR_PROBING)
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
+# Protobuf 22 and later needs Abseil and utf8_range, and their packages must be
+# found before protobuf's own is read, or its imported targets cannot be resolved.
+# (A gRPC built from source puts them in build/proto; with conda one
+# CMAKE_PREFIX_PATH covers all of it. utf8_range only exists with newer protobuf.)
+find_package(absl CONFIG REQUIRED PATHS "${CMAKE_CURRENT_SOURCE_DIR}/build/proto/lib/cmake/absl")
+find_package(utf8_range CONFIG QUIET HINTS "${CMAKE_CURRENT_SOURCE_DIR}/build/proto")
+
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
 find_package(Protobuf CONFIG REQUIRED
-            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build")
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/build/proto")
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 
 ## Set a variable which points to a library installed on machine - Protobuf
@@ -35,12 +49,9 @@ else()
     set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
 endif()
 
-# Find Abseil before gRPC
-find_package(absl CONFIG REQUIRED PATHS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build/lib/cmake/absl")
-
 # Locate and verify version of gRPC
 find_package(gRPC CONFIG REQUIRED
-            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/proto-build" )
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/build/proto" )
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
 # Set a variable which points to a library installed on machine - gRPC for C++
@@ -66,26 +77,32 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # Sources for file reading and messaging
-add_library(classify
-    kraken2/src/compact_hash.cc
-    kraken2/src/taxonomy.cc
-    kraken2/src/mmap_file.cc
-    kraken2/src/omp_hack.cc
-    kraken2/src/mmscanner.cc
-    kraken2/src/fast_reader.cc
-    kraken2/src/aa_translate.cc
-    kraken2/src/utilities.cc
-    kraken2/src/hyperloglogplus.cc
-    kraken2/src/reports.cc)
+add_library(kraken2_upstream STATIC
+    third_party/kraken2/src/compact_hash.cc
+    third_party/kraken2/src/taxonomy.cc
+    third_party/kraken2/src/mmap_file.cc
+    third_party/kraken2/src/omp_hack.cc
+    third_party/kraken2/src/mmscanner.cc
+    third_party/kraken2/src/fast_reader.cc
+    third_party/kraken2/src/aa_translate.cc
+    third_party/kraken2/src/utilities.cc
+    third_party/kraken2/src/hyperloglogplus.cc
+    third_party/kraken2/src/reports.cc)
 
 # Specify the headers (include) for this lib (target) and declare them PUBLIC so are findable by other libs/executables
-target_include_directories(classify PUBLIC kraken2/src/)
-target_link_libraries(classify PUBLIC ZLIB::ZLIB Threads::Threads)
+target_include_directories(kraken2_upstream PUBLIC third_party/kraken2/src/)
+target_link_libraries(kraken2_upstream PUBLIC ZLIB::ZLIB Threads::Threads)
 
 # Execute the CMakeLists.txt in these folders
-add_subdirectory(protos)
-add_subdirectory(utils)
-add_subdirectory(server)
-add_subdirectory(client)
-add_subdirectory(tests)
+enable_testing()
+
+# Our code is under src/. Each part is built in a directory of its own name, so
+# configured with -B build/kraken2-server the server ends up at
+# build/kraken2-server/server/kraken2_server.
+add_subdirectory(src/common common)
+add_subdirectory(src/core core)
+add_subdirectory(src/protos protos)
+add_subdirectory(src/server server)
+add_subdirectory(src/client client)
+add_subdirectory(tests tests)
 
